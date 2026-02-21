@@ -14,6 +14,7 @@
   --panel: #fffaf0;
   --button: #0f766e;
   --button-hover: #0b5f59;
+  --button-soft: #e8f5f2;
   --error: #a13131;
   --success: #1d6f4f;
 }
@@ -45,12 +46,24 @@ main {
 }
 
 .panel {
-  width: min(560px, 100%);
+  width: min(860px, 100%);
   background: color-mix(in oklab, var(--panel) 90%, white 10%);
   border: 1px solid var(--line);
   border-radius: 20px;
-  padding: 28px;
+  padding: 26px;
   box-shadow: 0 22px 48px rgba(24, 59, 53, 0.12);
+}
+
+.home-panel {
+  width: min(620px, 100%);
+}
+
+.login-panel {
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
 }
 
 .eyebrow {
@@ -63,18 +76,18 @@ main {
 
 h1 {
   margin: 8px 0 10px;
-  font-size: clamp(1.45rem, 4.5vw, 2rem);
+  font-size: clamp(1.4rem, 4.5vw, 2rem);
   line-height: 1.15;
 }
 
 .hint {
-  margin: 0 0 20px;
+  margin: 0 0 14px;
   color: var(--ink-soft);
 }
 
 form {
   display: grid;
-  gap: 12px;
+  gap: 10px;
 }
 
 label {
@@ -82,7 +95,8 @@ label {
   font-size: 0.95rem;
 }
 
-input {
+input,
+textarea {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -92,7 +106,13 @@ input {
   background: #fff;
 }
 
-input:focus {
+textarea {
+  min-height: 90px;
+  resize: vertical;
+}
+
+input:focus,
+textarea:focus {
   outline: 2px solid #5cb3a3;
   outline-offset: 2px;
 }
@@ -103,19 +123,25 @@ input:focus {
   padding-block: 4px;
 }
 
-button {
+button,
+.link-button {
   border: 0;
   border-radius: 11px;
-  padding: 11px 14px;
+  padding: 10px 14px;
   font: inherit;
   font-weight: 600;
   color: #fff;
   background: var(--button);
   cursor: pointer;
   transition: background-color 160ms ease;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
-button:hover:not(:disabled) {
+button:hover:not(:disabled),
+.link-button:hover {
   background: var(--button-hover);
 }
 
@@ -124,8 +150,40 @@ button:disabled {
   cursor: not-allowed;
 }
 
+button.ghost,
+.ghost {
+  background: var(--button-soft);
+  color: var(--ink);
+  border: 1px solid var(--line);
+}
+
+button.ghost:hover,
+.ghost:hover {
+  background: #daede7;
+}
+
+.actions {
+  margin-top: 14px;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.auth-line {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.auth-line.compact {
+  margin-top: 0;
+}
+
 .message {
-  margin: 14px 0 0;
+  margin: 12px 0 0;
   font-size: 0.95rem;
 }
 
@@ -133,27 +191,210 @@ button:disabled {
   color: var(--error);
 }
 
+.message.info,
 .message.success {
   color: var(--success);
 }
 
-.result {
-  margin-top: 12px;
+.header-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.session-tools {
+  margin: 14px 0;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.tabs {
+  display: inline-flex;
+  gap: 8px;
+}
+
+.tabs button {
+  background: var(--button-soft);
+  color: var(--ink);
   border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 10px 12px;
+}
+
+.tabs button.active {
+  background: var(--button);
+  color: #fff;
+}
+
+.update-controls {
+  display: inline-flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.update-controls button {
+  background: var(--button-soft);
+  color: var(--ink);
+  border: 1px solid var(--line);
+}
+
+.update-controls button.active {
+  background: var(--button);
+  color: #fff;
+}
+
+.interacted-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  padding: 8px 10px;
+  background: var(--button-soft);
+  color: var(--ink);
+  font-size: 0.92rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.interacted-toggle input {
+  width: auto;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  margin: 0;
+  background: transparent;
+  accent-color: var(--button);
+}
+
+.question-form {
+  margin-top: 6px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
   background: #fff;
 }
 
-.result code {
-  display: block;
-  margin-top: 3px;
-  white-space: pre-wrap;
+.question-form-bottom {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
 }
 
-@media (max-width: 640px) {
+.question-list {
+  margin-top: 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.question-item {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fff;
+  padding: 12px;
+}
+
+.question-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+}
+
+.question-body {
+  margin: 8px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.answered-badge {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid #8cbca7;
+  background: #edf9f3;
+  color: #225443;
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.answering-badge {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid #7fabc6;
+  background: #eef7ff;
+  color: #214863;
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.question-footer {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.vote-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+.vote-actions button {
+  background: var(--button-soft);
+  color: var(--ink);
+  border: 1px solid var(--line);
+}
+
+.vote-actions button.active {
+  background: var(--button);
+  color: #fff;
+}
+
+.admin-actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.admin-actions .danger {
+  border-color: #dca1a1;
+  color: #8a2b2b;
+  background: #fff4f4;
+}
+
+.admin-actions .danger:hover {
+  background: #ffe8e8;
+}
+
+@media (max-width: 760px) {
   .panel {
     border-radius: 16px;
-    padding: 20px;
+    padding: 18px;
+  }
+
+  .question-footer {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .vote-actions {
+    margin-left: 0;
+  }
+
+  .admin-actions {
+    margin-left: 0;
   }
 }

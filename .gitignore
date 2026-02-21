@@ -1,0 +1,9 @@
+backend/target/
+backend/target-wsl/
+backend/qstream.db
+backend/qstream.db-shm
+backend/qstream.db-wal
+backend/.env
+frontend/node_modules/
+frontend/dist/
+frontend/.env

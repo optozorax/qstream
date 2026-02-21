@@ -1,0 +1,159 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap');
+
+:root {
+  font-family: 'Space Grotesk', 'Segoe UI', 'Trebuchet MS', sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  --bg-main: #f5efe0;
+  --bg-accent: #e2f6f0;
+  --ink: #132421;
+  --ink-soft: #3a4f4a;
+  --line: #9fbbb4;
+  --panel: #fffaf0;
+  --button: #0f766e;
+  --button-hover: #0b5f59;
+  --error: #a13131;
+  --success: #1d6f4f;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at 0% 0%, #d7ece6 0, transparent 40%),
+    radial-gradient(circle at 100% 100%, #efd8bc 0, transparent 45%),
+    linear-gradient(140deg, var(--bg-main), var(--bg-accent));
+}
+
+#app {
+  width: 100%;
+}
+
+main {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.panel {
+  width: min(560px, 100%);
+  background: color-mix(in oklab, var(--panel) 90%, white 10%);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 28px;
+  box-shadow: 0 22px 48px rgba(24, 59, 53, 0.12);
+}
+
+.eyebrow {
+  margin: 0;
+  font-size: 0.78rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+
+h1 {
+  margin: 8px 0 10px;
+  font-size: clamp(1.45rem, 4.5vw, 2rem);
+  line-height: 1.15;
+}
+
+.hint {
+  margin: 0 0 20px;
+  color: var(--ink-soft);
+}
+
+form {
+  display: grid;
+  gap: 12px;
+}
+
+label {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font: inherit;
+  color: var(--ink);
+  background: #fff;
+}
+
+input:focus {
+  outline: 2px solid #5cb3a3;
+  outline-offset: 2px;
+}
+
+.captcha-slot {
+  min-height: 78px;
+  overflow-x: auto;
+  padding-block: 4px;
+}
+
+button {
+  border: 0;
+  border-radius: 11px;
+  padding: 11px 14px;
+  font: inherit;
+  font-weight: 600;
+  color: #fff;
+  background: var(--button);
+  cursor: pointer;
+  transition: background-color 160ms ease;
+}
+
+button:hover:not(:disabled) {
+  background: var(--button-hover);
+}
+
+button:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.message {
+  margin: 14px 0 0;
+  font-size: 0.95rem;
+}
+
+.message.error {
+  color: var(--error);
+}
+
+.message.success {
+  color: var(--success);
+}
+
+.result {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: #fff;
+}
+
+.result code {
+  display: block;
+  margin-top: 3px;
+  white-space: pre-wrap;
+}
+
+@media (max-width: 640px) {
+  .panel {
+    border-radius: 16px;
+    padding: 20px;
+  }
+}

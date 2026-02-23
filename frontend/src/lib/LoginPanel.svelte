@@ -149,10 +149,9 @@
   }
 </script>
 
-<section class="panel login-panel">
-  <p class="eyebrow">QStream</p>
-  <h1>{title}</h1>
-  <p class="hint">{subtitle}</p>
+<div class="login-section">
+  <h2>{title}</h2>
+  <p class="subtitle">{subtitle}</p>
 
   <form on:submit={submitForm}>
     <label for="nickname">Nickname</label>
@@ -167,12 +166,18 @@
 
     <div class="captcha-slot" bind:this={captchaContainer}></div>
 
-    <button type="submit" disabled={status === 'loading' || !captchaReady}>
+    <button type="submit" class="btn btn-primary" disabled={status === 'loading' || !captchaReady}>
       {status === 'loading' ? 'Processing...' : submitLabel}
     </button>
   </form>
 
   {#if message}
-    <p class={`message ${status}`}>{message}</p>
+    <p class="msg {status === 'error' ? 'msg-error' : 'msg-success'}">{message}</p>
   {/if}
-</section>
+</div>
+
+<style>
+  .login-section {
+    width: 100%;
+  }
+</style>

@@ -537,21 +537,19 @@
     }
   }
 
+  $: admin = !!currentUser && !!sessionData && currentUser.id === sessionData.owner_user_id
+
+  $: viewerCanInteract =
+    !!currentUser &&
+    !(route.name === 'session' && ownSessionCode && route.code === ownSessionCode) &&
+    !(sessionData && currentUser.id === sessionData.owner_user_id)
+
   function isAdmin() {
-    return !!currentUser && !!sessionData && currentUser.id === sessionData.owner_user_id
+    return admin
   }
 
   function canUseViewerInteractions() {
-    if (!currentUser) {
-      return false
-    }
-    if (route.name === 'session' && ownSessionCode && route.code === ownSessionCode) {
-      return false
-    }
-    if (sessionData && currentUser.id === sessionData.owner_user_id) {
-      return false
-    }
-    return true
+    return viewerCanInteract
   }
 
   async function moderateQuestion(questionId, action) {
@@ -560,7 +558,7 @@
       return
     }
 
-    if (!isAdmin()) {
+    if (!admin) {
       questionStatus = 'Only session owner can moderate questions.'
       return
     }
@@ -598,247 +596,288 @@
 
   function formatTime(unixTime) {
     const date = new Date(unixTime * 1000)
-    return date.toLocaleString()
+    const now = new Date()
+    const diffMs = now - date
+    const diffMin = Math.floor(diffMs / 60000)
+    const diffHr = Math.floor(diffMs / 3600000)
+
+    if (diffMin < 1) return 'just now'
+    if (diffMin < 60) return `${diffMin}m ago`
+    if (diffHr < 24) return `${diffHr}h ago`
+    return date.toLocaleDateString()
+  }
+
+  function userInitial(nickname) {
+    return (nickname || '?')[0].toUpperCase()
   }
 </script>
 
-<main>
+<div class="app-shell">
   {#if route.name === 'home'}
-    <section class="panel home-panel">
-      <p class="eyebrow">QStream</p>
-      <h1>Streamer Question Room</h1>
-      <p class="hint">
-        Login with nickname + hCaptcha, then create one session and share its link with viewers.
-      </p>
-
-      {#if currentUser}
-        <div class="auth-line">
-          <span>Logged in as <strong>{currentUser.nickname}</strong></span>
-          <button type="button" class="ghost" on:click={logout}>Logout</button>
-        </div>
-      {:else}
-        <LoginPanel
-          {apiBase}
-          {siteKey}
-          title="Login"
-          subtitle="Use your nickname and pass hCaptcha."
-          submitLabel="Login"
-          on:success={handleLoginSuccess}
-        />
-      {/if}
-
-      {#if currentUser}
-        <div class="actions">
-          <button type="button" on:click={createSession} disabled={creatingSession}>
-            {creatingSession ? 'Creating...' : 'Create'}
-          </button>
-
-          {#if storedSessionCode}
-            <a class="link-button" href={`/s/${storedSessionCode}`}>Open current session</a>
-          {/if}
-        </div>
-      {/if}
-
-      {#if homeMessage}
-        <p class="message info">{homeMessage}</p>
-      {/if}
-    </section>
-  {:else}
-    <section class="panel session-panel">
-      <div class="header-row">
-        <div>
-          <p class="eyebrow">Public Session</p>
-          <h1>Session {route.code}</h1>
-        </div>
-        <a class="ghost" href="/">Back to main</a>
-      </div>
-
-      <p class="hint">
-        This is the public question list. Sort and live auto-updates are available for everyone. SSE: {sseConnected ? 'connected' : 'reconnecting'}.
-      </p>
-
-      <div class="session-tools">
-        <div class="tabs">
-          <button
-            type="button"
-            class:active={sessionSort === 'top'}
-            on:click={() => changeSort('top')}
-          >
-            Top
-          </button>
-          <button
-            type="button"
-            class:active={sessionSort === 'new'}
-            on:click={() => changeSort('new')}
-          >
-            New
-          </button>
-          <button
-            type="button"
-            class:active={sessionSort === 'answered'}
-            on:click={() => changeSort('answered')}
-          >
-            Answered
-          </button>
-        </div>
-
-        <div class="update-controls">
-          <button
-            type="button"
-            class:active={updateMode === 'manual'}
-            on:click={() => setUpdateMode('manual')}
-          >
-            Manual
-          </button>
-          <button
-            type="button"
-            class:active={updateMode === 'auto'}
-            on:click={() => setUpdateMode('auto')}
-          >
-            Auto (live)
-          </button>
-          <button type="button" class="ghost" on:click={() => refreshQuestions()}>
-            {pendingNewQuestions > 0 ? `Update now (${pendingNewQuestions} new)` : 'Update now'}
-          </button>
-          {#if canUseViewerInteractions()}
-            <label class="interacted-toggle">
-              <input type="checkbox" bind:checked={hideInteracted} />
-              <span>Hide interacted</span>
-            </label>
-          {/if}
-        </div>
+    <!-- HOME PAGE -->
+    <div class="app-body" style="display: grid; place-items: center; min-height: 100vh;">
+      <div class="card card-centered">
+        <span class="label-tag">QStream</span>
+        <h1>Question Room</h1>
+        <p class="subtitle">
+          Collect and rank audience questions in real time during your stream.
+        </p>
 
         {#if currentUser}
-          <div class="auth-line compact">
-            <span><strong>{currentUser.nickname}</strong></span>
-            <button type="button" class="ghost" on:click={logout}>Logout</button>
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px;">
+            <div class="user-pill">
+              <span class="user-avatar">{userInitial(currentUser.nickname)}</span>
+              {currentUser.nickname}
+            </div>
+            <button type="button" class="btn btn-ghost" on:click={logout}>Log out</button>
+          </div>
+
+          <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+            <button type="button" class="btn btn-primary" on:click={createSession} disabled={creatingSession}>
+              {creatingSession ? 'Creating...' : 'Create session'}
+            </button>
+
+            {#if storedSessionCode}
+              <a class="btn btn-secondary" href={`/s/${storedSessionCode}`}>
+                Open session
+              </a>
+            {/if}
           </div>
         {:else}
-          <button type="button" class="ghost" on:click={() => (showSessionLogin = !showSessionLogin)}>
-            {showSessionLogin ? 'Close login' : 'Login'}
-          </button>
+          <LoginPanel
+            {apiBase}
+            {siteKey}
+            title="Get started"
+            subtitle="Enter a nickname and verify to continue."
+            submitLabel="Continue"
+            on:success={handleLoginSuccess}
+          />
+        {/if}
+
+        {#if homeMessage}
+          <p class="msg msg-info">{homeMessage}</p>
+        {/if}
+      </div>
+    </div>
+
+  {:else}
+    <!-- SESSION PAGE -->
+    <header class="app-header">
+      <div class="app-header-inner">
+        <a class="app-logo" href="/" on:click|preventDefault={() => goto('/')}>QStream</a>
+
+        <div class="app-header-right">
+          <span class="text-sm text-secondary">
+            <span class="status-dot" class:connected={sseConnected} class:disconnected={!sseConnected}></span>
+            {sseConnected ? 'Live' : 'Reconnecting'}
+          </span>
+
+          {#if currentUser}
+            <div class="user-pill">
+              <span class="user-avatar">{userInitial(currentUser.nickname)}</span>
+              {currentUser.nickname}
+            </div>
+            <button type="button" class="btn btn-ghost btn-sm" on:click={logout}>Log out</button>
+          {:else}
+            <button type="button" class="btn btn-secondary btn-sm" on:click={() => (showSessionLogin = !showSessionLogin)}>
+              {showSessionLogin ? 'Cancel' : 'Log in'}
+            </button>
+          {/if}
+        </div>
+      </div>
+    </header>
+
+    <div class="app-body">
+      <div style="margin-bottom: 20px;">
+        <span class="label-tag">Session</span>
+        <h1>{route.code}</h1>
+        {#if admin}
+          <p class="text-sm text-secondary">You own this session. Use moderation controls on each question.</p>
+        {:else if currentUser}
+          <p class="text-sm text-secondary">Ask questions and vote on others.</p>
+        {:else}
+          <p class="text-sm text-secondary">Log in to ask questions and vote.</p>
         {/if}
       </div>
 
-      {#if isAdmin()}
-        <p class="hint">Admin mode: use `Answer` to start, then `Finish answering` to move question to answered. Auto updates are default.</p>
-      {:else if !currentUser}
-        <p class="hint">Guest mode: auto updates are default.</p>
-      {:else}
-        <p class="hint">Viewer mode: manual updates are default.</p>
-      {/if}
-
       {#if !currentUser && showSessionLogin}
-        <LoginPanel
-          {apiBase}
-          {siteKey}
-          title="Login to interact"
-          subtitle="After login you can ask questions and vote."
-          submitLabel="Login"
-          on:success={handleLoginSuccess}
-        />
+        <div class="card section-gap" style="margin-bottom: 16px;">
+          <LoginPanel
+            {apiBase}
+            {siteKey}
+            title="Log in to interact"
+            subtitle="After login you can ask questions and vote."
+            submitLabel="Log in"
+            on:success={handleLoginSuccess}
+          />
+        </div>
       {/if}
 
-      {#if canUseViewerInteractions()}
-        <form class="question-form" on:submit={submitQuestion}>
-          <label for="question">Ask a question</label>
-          <textarea
-            id="question"
-            maxlength="300"
-            bind:value={questionText}
-            placeholder="Plain text only, max 300 chars"
-          ></textarea>
-          <div class="question-form-bottom">
-            <span>{questionText.trim().length}/300</span>
-            <button type="submit" disabled={questionBusy}>
-              {questionBusy ? 'Sending...' : 'Send question'}
-            </button>
-          </div>
-        </form>
-      {:else if isAdmin()}
-        <p class="hint">Owner mode: question submission is disabled for the session owner.</p>
+      {#if viewerCanInteract}
+        <div class="q-form">
+          <form on:submit={submitQuestion}>
+            <textarea
+              maxlength="300"
+              bind:value={questionText}
+              placeholder="Type your question..."
+            ></textarea>
+            <div class="q-form-footer">
+              <span class="char-count">{questionText.trim().length} / 300</span>
+              <button type="submit" class="btn btn-primary btn-sm" disabled={questionBusy}>
+                {questionBusy ? 'Sending...' : 'Ask'}
+              </button>
+            </div>
+          </form>
+        </div>
       {/if}
 
       {#if questionStatus}
-        <p class="message info">{questionStatus}</p>
+        <p class="msg {questionStatus.includes('failed') || questionStatus.includes('Failed') || questionStatus.includes('error') || questionStatus.includes('Error') || questionStatus.includes('cannot') || questionStatus.includes('Cannot') || questionStatus.includes('Only') || questionStatus.includes('Login first') || questionStatus.includes('max length') ? 'msg-error' : 'msg-success'}">{questionStatus}</p>
       {/if}
 
       {#if sessionError}
-        <p class="message error">{sessionError}</p>
+        <p class="msg msg-error">{sessionError}</p>
       {/if}
 
+      <!-- Toolbar -->
+      <div class="toolbar section-gap">
+        <div class="tab-bar">
+          <button
+            type="button"
+            class="tab"
+            class:active={sessionSort === 'top'}
+            on:click={() => changeSort('top')}
+          >Top</button>
+          <button
+            type="button"
+            class="tab"
+            class:active={sessionSort === 'new'}
+            on:click={() => changeSort('new')}
+          >New</button>
+          <button
+            type="button"
+            class="tab"
+            class:active={sessionSort === 'answered'}
+            on:click={() => changeSort('answered')}
+          >Answered</button>
+        </div>
+
+        <div class="toolbar-spacer"></div>
+
+        {#if viewerCanInteract}
+          <label class="toggle-label">
+            <input type="checkbox" bind:checked={hideInteracted} />
+            Hide voted
+          </label>
+        {/if}
+
+        <div class="tab-bar">
+          <button
+            type="button"
+            class="tab"
+            class:active={updateMode === 'auto'}
+            on:click={() => setUpdateMode('auto')}
+          >Auto</button>
+          <button
+            type="button"
+            class="tab"
+            class:active={updateMode === 'manual'}
+            on:click={() => setUpdateMode('manual')}
+          >Manual</button>
+        </div>
+
+        <button type="button" class="btn btn-secondary btn-sm" on:click={() => refreshQuestions()}>
+          Refresh
+          {#if pendingNewQuestions > 0}
+            <span class="pending-count">{pendingNewQuestions}</span>
+          {/if}
+        </button>
+      </div>
+
+      <!-- Question list -->
       {#if loadingQuestions}
-        <p class="hint">Loading questions...</p>
+        <div class="empty-state">
+          <p class="text-secondary">Loading...</p>
+        </div>
       {/if}
 
-      <div class="question-list">
+      <div class="q-list">
         {#if visibleQuestions.length === 0 && !loadingQuestions}
-          <p class="hint">{hideInteracted && currentUser ? 'No questions left after your filter.' : 'No questions yet.'}</p>
+          <div class="empty-state">
+            <div class="empty-state-icon">?</div>
+            <p>{hideInteracted && currentUser ? 'All questions filtered.' : 'No questions yet.'}</p>
+          </div>
         {/if}
 
         {#each visibleQuestions as item}
-          <article class="question-item">
-            <div class="question-meta">
-              <span>@{item.author_nickname}</span>
-              <span>{formatTime(item.created_at)}</span>
-            </div>
-            {#if item.is_answering === 1}
-              <div class="answering-badge">Answer in progress</div>
-            {:else if item.is_answered === 1}
-              <div class="answered-badge">Answered</div>
-            {/if}
-            <p class="question-body">{item.body}</p>
-            <div class="question-footer">
-              <strong>Score: {item.score}</strong>
-              <span>{item.votes_count} votes</span>
-
-              {#if canUseViewerInteractions()}
-                <div class="vote-actions">
-                  <button
-                    type="button"
-                    class:active={localVotes[item.id] === 1}
-                    on:click={() => vote(item.id, 1)}
-                    disabled={voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1}
-                  >
-                    Like
-                  </button>
-                  <button
-                    type="button"
-                    class:active={localVotes[item.id] === -1}
-                    on:click={() => vote(item.id, -1)}
-                    disabled={voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1}
-                  >
-                    Dislike
-                  </button>
-                </div>
+          <article class="q-card" class:answering={item.is_answering === 1} class:answered={item.is_answered === 1}>
+            <div class="q-vote-col">
+              {#if viewerCanInteract}
+                <button
+                  type="button"
+                  class="q-vote-btn"
+                  class:upvoted={localVotes[item.id] === 1}
+                  on:click={() => vote(item.id, 1)}
+                  disabled={voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1}
+                  title="Upvote"
+                >&#9650;</button>
               {/if}
 
-              {#if isAdmin()}
-                <div class="admin-actions">
+              <span class="q-score">{item.score}</span>
+
+              {#if viewerCanInteract}
+                <button
+                  type="button"
+                  class="q-vote-btn"
+                  class:downvoted={localVotes[item.id] === -1}
+                  on:click={() => vote(item.id, -1)}
+                  disabled={voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1}
+                  title="Downvote"
+                >&#9660;</button>
+              {/if}
+            </div>
+
+            <div class="q-body-col">
+              {#if item.is_answering === 1}
+                <span class="badge badge-answering">Answering</span>
+              {:else if item.is_answered === 1}
+                <span class="badge badge-answered">Answered</span>
+              {/if}
+
+              <p class="q-text">{item.body}</p>
+
+              <div class="q-meta">
+                <span>@{item.author_nickname}</span>
+                <span class="q-meta-sep">&middot;</span>
+                <span>{formatTime(item.created_at)}</span>
+                <span class="q-meta-sep">&middot;</span>
+                <span>{item.votes_count} vote{item.votes_count === 1 ? '' : 's'}</span>
+              </div>
+
+              {#if admin}
+                <div class="q-actions">
                   {#if item.is_answered === 0}
                     <button
                       type="button"
-                      class="ghost"
+                      class="btn btn-secondary btn-sm"
                       on:click={() => moderateQuestion(item.id, item.is_answering === 1 ? 'finish_answering' : 'answer')}
                       disabled={moderateBusy.has(item.id)}
                     >
-                      {item.is_answering === 1 ? 'Finish answering' : 'Answer'}
+                      {item.is_answering === 1 ? 'Done' : 'Answer'}
                     </button>
                   {/if}
                   <button
                     type="button"
-                    class="ghost danger"
+                    class="btn btn-danger btn-sm"
                     on:click={() => moderateQuestion(item.id, 'delete')}
                     disabled={moderateBusy.has(item.id)}
-                  >
-                    Delete
-                  </button>
+                  >Delete</button>
                 </div>
               {/if}
             </div>
           </article>
         {/each}
       </div>
-    </section>
+    </div>
   {/if}
-</main>
+</div>

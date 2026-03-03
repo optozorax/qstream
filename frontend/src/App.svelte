@@ -25,7 +25,6 @@
   }
 
   const apiBase = resolveApiBase(import.meta.env.VITE_API_BASE_URL)
-  const siteKey = import.meta.env.VITE_HCAPTCHA_SITE_KEY ?? ''
 
   const AUTH_TOKEN_KEY = 'qstream_auth_token'
   const USER_KEY = 'qstream_user'
@@ -74,7 +73,7 @@
       : questions
 
   onMount(() => {
-    void validateStoredAuth()
+    void processOauthCallbackAndValidate()
 
     const onPopState = () => {
       route = parseRoute(window.location.pathname)
@@ -239,21 +238,6 @@
     }
   }
 
-  function setAuth(payload) {
-    authToken = payload.auth_token
-    currentUser = payload.user
-
-    localStorage.setItem(AUTH_TOKEN_KEY, authToken)
-    localStorage.setItem(USER_KEY, JSON.stringify(currentUser))
-
-    if (payload.session?.public_code) {
-      setOwnSessionCode(payload.session.public_code)
-      setSessionCode(payload.session.public_code)
-    } else {
-      setOwnSessionCode('')
-    }
-  }
-
   function logout() {
     authToken = ''
     currentUser = null
@@ -320,6 +304,87 @@
     return payload
   }
 
+  function parseHashParams(hash) {
+    const raw = hash?.startsWith('#') ? hash.slice(1) : hash
+    if (!raw) {
+      return new URLSearchParams()
+    }
+    return new URLSearchParams(raw)
+  }
+
+  function clearHashFragment() {
+    if (!window.location.hash) {
+      return
+    }
+    const cleanUrl = `${window.location.pathname}${window.location.search}`
+    history.replaceState({}, '', cleanUrl)
+  }
+
+  function oauthErrorMessage(code) {
+    switch (code) {
+      case 'oauth_denied':
+      case 'oauth_provider_error':
+        return 'Google login was canceled or denied.'
+      case 'missing_state':
+      case 'invalid_state':
+        return 'Google login failed: invalid auth state. Please retry.'
+      case 'missing_authorization_code':
+        return 'Google login failed: no authorization code.'
+      case 'oauth_token_exchange_failed':
+        return 'Google login failed while exchanging token.'
+      case 'oauth_userinfo_failed':
+        return 'Google login failed while loading profile.'
+      default:
+        return 'Google login failed. Please retry.'
+    }
+  }
+
+  async function processOauthCallbackAndValidate() {
+    const hashParams = parseHashParams(window.location.hash)
+    const tokenFromHash = hashParams.get('auth_token')
+    const authError = hashParams.get('auth_error')
+
+    if (tokenFromHash) {
+      authToken = tokenFromHash
+      localStorage.setItem(AUTH_TOKEN_KEY, authToken)
+
+      try {
+        const user = await apiRequest('/api/me', { auth: true })
+        if (user && typeof user === 'object') {
+          currentUser = user
+          localStorage.setItem(USER_KEY, JSON.stringify(currentUser))
+          if (route.name === 'session') {
+            showSessionLogin = false
+            questionStatus = 'Logged in. You can ask and vote now.'
+            localVotes = {}
+            loadInteractedQuestions(route.code)
+          } else {
+            homeMessage = 'Logged in successfully.'
+          }
+        }
+      } catch {
+        logout()
+        if (route.name === 'session') {
+          questionStatus = 'Google login failed. Please retry.'
+        } else {
+          homeMessage = 'Google login failed. Please retry.'
+        }
+      } finally {
+        clearHashFragment()
+      }
+    } else if (authError) {
+      const message = oauthErrorMessage(authError)
+      if (route.name === 'session') {
+        questionStatus = message
+      } else {
+        homeMessage = message
+      }
+      clearHashFragment()
+    }
+
+    await validateStoredAuth()
+  }
+
   async function validateStoredAuth() {
     if (!authToken || !currentUser) {
       return
@@ -370,22 +435,6 @@
       homeMessage = error instanceof Error ? error.message : 'Failed to create session.'
     } finally {
       creatingSession = false
-    }
-  }
-
-  function handleLoginSuccess(event) {
-    const payload = event.detail
-    setAuth(payload)
-
-    if (route.name === 'home' && payload.session?.public_code) {
-      setSessionCode(payload.session.public_code)
-    }
-
-    if (route.name === 'session') {
-      showSessionLogin = false
-      questionStatus = 'Logged in. You can ask and vote now.'
-      localVotes = {}
-      loadInteractedQuestions(route.code)
     }
   }
 
@@ -723,11 +772,10 @@
         {:else}
           <LoginPanel
             {apiBase}
-            {siteKey}
             title="Get started"
-            subtitle="Enter a nickname and verify to continue."
-            submitLabel="Continue"
-            on:success={handleLoginSuccess}
+            subtitle="Continue with Google to participate."
+            submitLabel="Continue with Google"
+            returnTo="/"
           />
         {/if}
 
@@ -781,11 +829,10 @@
         <div class="card section-gap" style="margin-bottom: 16px;">
           <LoginPanel
             {apiBase}
-            {siteKey}
             title="Log in to interact"
-            subtitle="After login you can ask questions and vote."
-            submitLabel="Log in"
-            on:success={handleLoginSuccess}
+            subtitle="Continue with Google to ask questions and vote."
+            submitLabel="Continue with Google"
+            returnTo={`/s/${route.code}`}
           />
         </div>
       {/if}

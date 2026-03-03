@@ -16,6 +16,9 @@ SSH_KEY_PATH=<path_to_private_key>
 PUBLIC_HOST=<public_https_host>
 REMOTE_FRONTEND_INTERNAL_PORT=45173
 REMOTE_BACKEND_INTERNAL_PORT=43000
+GOOGLE_CLIENT_ID=<google_client_id>
+GOOGLE_CLIENT_SECRET=<google_client_secret>
+GOOGLE_REDIRECT_URI=https://<public_https_host>/api/google_oauth2
 ```
 
 You can start from `.env.local.example`.
@@ -33,6 +36,20 @@ INSTALL_FRONTEND_DEPS=0 ./scripts/run-dev-tunnel.sh
 ```
 
 Keep that process running while testing.
+
+### Google OAuth prerequisites
+
+Set OAuth envs in `.env.local` (or `backend/.env`, both are local-only):
+
+```bash
+GOOGLE_CLIENT_ID=...
+GOOGLE_CLIENT_SECRET=...
+GOOGLE_REDIRECT_URI=https://<PUBLIC_HOST>/api/google_oauth2
+```
+
+Google OAuth app should allow:
+- Authorized JavaScript origin: `https://<PUBLIC_HOST>`
+- Authorized redirect URI: `https://<PUBLIC_HOST>/api/google_oauth2`
 
 ### Quick verification
 

@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     nickname TEXT NOT NULL,
+    google_sub TEXT UNIQUE,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     last_login_at INTEGER NOT NULL DEFAULT (unixepoch()),
     last_hcaptcha_at INTEGER NOT NULL DEFAULT (unixepoch())
@@ -17,6 +18,16 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_id
     ON auth_sessions(user_id);
+
+CREATE TABLE IF NOT EXISTS oauth_login_states (
+    state TEXT PRIMARY KEY,
+    return_to TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    expires_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_oauth_login_states_expires_at
+    ON oauth_login_states(expires_at);
 
 CREATE TABLE IF NOT EXISTS stream_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

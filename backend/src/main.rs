@@ -4,7 +4,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Redirect,
     },
     routing::{get, post},
     Json, Router,
@@ -32,9 +32,9 @@ use uuid::Uuid;
 struct AppState {
     db: SqlitePool,
     http: Client,
-    hcaptcha_secret: Option<String>,
-    hcaptcha_site_key: Option<String>,
-    hcaptcha_skip_verify: bool,
+    google_client_id: Option<String>,
+    google_client_secret: Option<String>,
+    google_redirect_uri: Option<String>,
     public_base_url: String,
     session_events: SessionEventBus,
     sse_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
@@ -69,7 +69,11 @@ impl SessionEventBus {
         channels.retain(|_, sender| sender.receiver_count() > 0);
         let removed = before - channels.len();
         if removed > 0 {
-            tracing::debug!(removed, remaining = channels.len(), "cleaned up idle SSE channels");
+            tracing::debug!(
+                removed,
+                remaining = channels.len(),
+                "cleaned up idle SSE channels"
+            );
         }
     }
 }
@@ -174,17 +178,16 @@ impl IntoResponse for AppError {
     }
 }
 
-#[derive(Deserialize)]
-struct RegisterRequest {
-    nickname: String,
-    hcaptcha_token: String,
+#[derive(Deserialize, Default)]
+struct GoogleOAuthStartQuery {
+    return_to: Option<String>,
 }
 
-#[derive(Serialize)]
-struct RegisterResponse {
-    user: User,
-    auth_token: String,
-    session: Option<StreamSession>,
+#[derive(Deserialize, Default)]
+struct GoogleOAuthCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -280,10 +283,14 @@ struct HealthResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct HcaptchaVerifyResponse {
-    success: bool,
-    #[serde(rename = "error-codes", default)]
-    error_codes: Vec<String>,
+struct GoogleTokenResponse {
+    access_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleUserInfoResponse {
+    sub: String,
+    name: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -353,11 +360,9 @@ async fn main() -> anyhow::Result<()> {
     let public_base_url =
         env::var("PUBLIC_BASE_URL").unwrap_or_else(|_| "http://localhost:5173".to_string());
 
-    let hcaptcha_secret = env::var("HCAPTCHA_SECRET").ok();
-    let hcaptcha_site_key = env::var("HCAPTCHA_SITE_KEY").ok();
-    let hcaptcha_skip_verify = env::var("HCAPTCHA_SKIP_VERIFY")
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
+    let google_client_id = env::var("GOOGLE_CLIENT_ID").ok();
+    let google_client_secret = env::var("GOOGLE_CLIENT_SECRET").ok();
+    let google_redirect_uri = env::var("GOOGLE_REDIRECT_URI").ok();
     let reset_db_on_boot = env::var("RESET_DB_ON_BOOT")
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
@@ -366,7 +371,7 @@ async fn main() -> anyhow::Result<()> {
         db = %db_url,
         addr = %app_addr,
         frontend_origin = %frontend_origin,
-        hcaptcha_skip = hcaptcha_skip_verify,
+        google_oauth_configured = google_client_id.is_some() && google_client_secret.is_some() && google_redirect_uri.is_some(),
         reset_db = reset_db_on_boot,
         "starting qstream backend"
     );
@@ -405,9 +410,9 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         db,
         http: Client::new(),
-        hcaptcha_secret,
-        hcaptcha_site_key,
-        hcaptcha_skip_verify,
+        google_client_id,
+        google_client_secret,
+        google_redirect_uri,
         public_base_url,
         session_events,
         sse_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -421,13 +426,14 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("invalid FRONTEND_ORIGIN: {frontend_origin}"))?,
         )
     }
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+    .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+    .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/me", get(get_me))
-        .route("/api/register", post(register))
+        .route("/api/google_oauth2/start", get(google_oauth_start))
+        .route("/api/google_oauth2", get(google_oauth_callback))
         .route("/api/sessions", post(create_session))
         .route("/api/sessions/:code/events", get(session_events_handler))
         .route(
@@ -472,6 +478,47 @@ async fn init_db(db: &SqlitePool, reset_db_on_boot: bool) -> anyhow::Result<()> 
         .execute(db)
         .await?;
 
+    ensure_google_oauth_schema(db).await?;
+
+    Ok(())
+}
+
+async fn ensure_google_oauth_schema(db: &SqlitePool) -> anyhow::Result<()> {
+    let has_google_sub: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('users') WHERE name = 'google_sub' LIMIT 1;",
+    )
+    .fetch_optional(db)
+    .await?;
+
+    if has_google_sub.is_none() {
+        sqlx::query("ALTER TABLE users ADD COLUMN google_sub TEXT;")
+            .execute(db)
+            .await?;
+    }
+
+    sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub);")
+        .execute(db)
+        .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS oauth_login_states (
+            state TEXT PRIMARY KEY,
+            return_to TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            expires_at INTEGER NOT NULL
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_oauth_login_states_expires_at ON oauth_login_states(expires_at);",
+    )
+    .execute(db)
+    .await?;
+
     Ok(())
 }
 
@@ -479,10 +526,7 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { ok: true })
 }
 
-async fn get_me(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<User>, AppError> {
+async fn get_me(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<User>, AppError> {
     let auth = require_auth_user(&state, &headers).await?;
 
     let user = sqlx::query_as::<_, User>(
@@ -506,99 +550,178 @@ async fn get_me(
     Ok(Json(user))
 }
 
-async fn register(
+async fn google_oauth_start(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Json(payload): Json<RegisterRequest>,
-) -> Result<Json<RegisterResponse>, AppError> {
-    let nickname = payload.nickname.trim();
-    if !(2..=32).contains(&nickname.chars().count()) {
-        return Err(AppError::bad_request(
-            "nickname must contain 2..32 characters",
-        ));
-    }
+    Query(query): Query<GoogleOAuthStartQuery>,
+) -> Result<Redirect, AppError> {
+    let client_id = state
+        .google_client_id
+        .as_deref()
+        .ok_or_else(|| AppError::internal("GOOGLE_CLIENT_ID is not configured"))?;
+    let redirect_uri = state
+        .google_redirect_uri
+        .as_deref()
+        .ok_or_else(|| AppError::internal("GOOGLE_REDIRECT_URI is not configured"))?;
 
-    if payload.hcaptcha_token.trim().is_empty() {
-        return Err(AppError::bad_request("hcaptcha token is required"));
-    }
+    let return_to = sanitize_return_to(query.return_to.as_deref());
+    let state_token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
 
-    verify_hcaptcha(
-        &state,
-        payload.hcaptcha_token.trim(),
-        Some(addr.ip().to_string()),
-    )
-    .await?;
-
-    tracing::info!(ip = %addr.ip(), nickname, "registering new user");
-
-    // Always insert a new user (nicknames are not unique)
-    let user_id: i64 = sqlx::query_scalar(
-        r#"
-        INSERT INTO users (nickname, last_login_at, last_hcaptcha_at)
-        VALUES (?1, unixepoch(), unixepoch())
-        RETURNING id;
-        "#,
-    )
-    .bind(nickname)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|err| AppError::internal(format!("failed to save user: {err}")))?;
-
-    let user = sqlx::query_as::<_, User>(
-        r#"
-        SELECT
-            id,
-            nickname,
-            CAST(created_at AS INTEGER) AS created_at,
-            CAST(last_login_at AS INTEGER) AS last_login_at
-        FROM users
-        WHERE id = ?1;
-        "#,
-    )
-    .bind(user_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|err| AppError::internal(format!("failed to fetch user: {err}")))?;
-
-    let auth_token = format!("{}{}", Uuid::new_v4(), Uuid::new_v4().simple());
-    let token_hash = hash_token(&auth_token);
+    sqlx::query("DELETE FROM oauth_login_states WHERE expires_at <= unixepoch();")
+        .execute(&state.db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to cleanup oauth states: {err}")))?;
 
     sqlx::query(
         r#"
-        INSERT INTO auth_sessions (user_id, token_hash, created_at, last_seen_at)
-        VALUES (?1, ?2, unixepoch(), unixepoch());
+        INSERT INTO oauth_login_states (state, return_to, created_at, expires_at)
+        VALUES (?1, ?2, unixepoch(), unixepoch() + 600);
         "#,
     )
-    .bind(user.id)
-    .bind(token_hash)
+    .bind(&state_token)
+    .bind(&return_to)
     .execute(&state.db)
     .await
-    .map_err(|err| AppError::internal(format!("failed to create auth session: {err}")))?;
+    .map_err(|err| AppError::internal(format!("failed to create oauth state: {err}")))?;
 
-    let session = sqlx::query_as::<_, StreamSession>(
+    let mut auth_url = reqwest::Url::parse("https://accounts.google.com/o/oauth2/v2/auth")
+        .map_err(|err| AppError::internal(format!("failed to build oauth url: {err}")))?;
+    auth_url
+        .query_pairs_mut()
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("response_type", "code")
+        .append_pair("scope", "openid profile")
+        .append_pair("state", &state_token)
+        .append_pair("access_type", "online")
+        .append_pair("prompt", "select_account");
+
+    Ok(Redirect::to(auth_url.as_ref()))
+}
+
+async fn google_oauth_callback(
+    State(state): State<AppState>,
+    Query(query): Query<GoogleOAuthCallbackQuery>,
+) -> Result<Redirect, AppError> {
+    let client_id = state
+        .google_client_id
+        .as_deref()
+        .ok_or_else(|| AppError::internal("GOOGLE_CLIENT_ID is not configured"))?;
+    let client_secret = state
+        .google_client_secret
+        .as_deref()
+        .ok_or_else(|| AppError::internal("GOOGLE_CLIENT_SECRET is not configured"))?;
+    let redirect_uri = state
+        .google_redirect_uri
+        .as_deref()
+        .ok_or_else(|| AppError::internal("GOOGLE_REDIRECT_URI is not configured"))?;
+
+    let Some(state_token) = query.state.as_deref() else {
+        return Ok(Redirect::to("/#auth_error=missing_state"));
+    };
+
+    let return_to = match consume_oauth_state(&state.db, state_token).await {
+        Ok(return_to) => return_to,
+        Err(_) => return Ok(Redirect::to("/#auth_error=invalid_state")),
+    };
+
+    if let Some(error) = query.error.as_deref() {
+        let code = if error.is_empty() {
+            "oauth_denied"
+        } else {
+            "oauth_provider_error"
+        };
+        tracing::warn!(google_error = %error, "google oauth callback returned error");
+        return Ok(redirect_with_fragment(&return_to, code, None));
+    }
+
+    let Some(code) = query.code.as_deref() else {
+        return Ok(redirect_with_fragment(
+            &return_to,
+            "missing_authorization_code",
+            None,
+        ));
+    };
+
+    let token_response = state
+        .http
+        .post("https://oauth2.googleapis.com/token")
+        .form(&[
+            ("code", code),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("redirect_uri", redirect_uri),
+            ("grant_type", "authorization_code"),
+        ])
+        .send()
+        .await
+        .map_err(|err| AppError::internal(format!("google token exchange failed: {err}")))?;
+
+    if !token_response.status().is_success() {
+        tracing::warn!(status = %token_response.status(), "google token exchange returned non-success");
+        return Ok(redirect_with_fragment(
+            &return_to,
+            "oauth_token_exchange_failed",
+            None,
+        ));
+    }
+
+    let token_payload: GoogleTokenResponse = token_response
+        .json()
+        .await
+        .map_err(|err| AppError::internal(format!("invalid google token response: {err}")))?;
+
+    let userinfo_response = state
+        .http
+        .get("https://openidconnect.googleapis.com/v1/userinfo")
+        .bearer_auth(&token_payload.access_token)
+        .send()
+        .await
+        .map_err(|err| AppError::internal(format!("google userinfo request failed: {err}")))?;
+
+    if !userinfo_response.status().is_success() {
+        tracing::warn!(status = %userinfo_response.status(), "google userinfo returned non-success");
+        return Ok(redirect_with_fragment(
+            &return_to,
+            "oauth_userinfo_failed",
+            None,
+        ));
+    }
+
+    let profile: GoogleUserInfoResponse = userinfo_response
+        .json()
+        .await
+        .map_err(|err| AppError::internal(format!("invalid google userinfo response: {err}")))?;
+
+    let nickname = normalize_google_name(profile.name.as_deref());
+
+    let user = sqlx::query_as::<_, User>(
         r#"
-        SELECT
+        INSERT INTO users (nickname, google_sub, last_login_at)
+        VALUES (?1, ?2, unixepoch())
+        ON CONFLICT(google_sub) DO UPDATE SET
+            nickname = excluded.nickname,
+            last_login_at = unixepoch()
+        RETURNING
             id,
-            owner_user_id,
-            public_code,
+            nickname,
             CAST(created_at AS INTEGER) AS created_at,
-            is_active
-        FROM stream_sessions
-        WHERE owner_user_id = ?1
-        LIMIT 1;
+            CAST(last_login_at AS INTEGER) AS last_login_at;
         "#,
     )
-    .bind(user.id)
-    .fetch_optional(&state.db)
+    .bind(&nickname)
+    .bind(&profile.sub)
+    .fetch_one(&state.db)
     .await
-    .map_err(|err| AppError::internal(format!("failed to query stream session: {err}")))?;
+    .map_err(|err| AppError::internal(format!("failed to upsert oauth user: {err}")))?;
 
-    tracing::info!(user_id = user.id, nickname = %user.nickname, "user registered");
-    Ok(Json(RegisterResponse {
-        user,
-        auth_token,
-        session,
-    }))
+    let auth_token = create_auth_session(&state.db, user.id).await?;
+
+    tracing::info!(user_id = user.id, nickname = %user.nickname, "google oauth login succeeded");
+    Ok(redirect_with_fragment(
+        &return_to,
+        "auth_token",
+        Some(&auth_token),
+    ))
 }
 
 async fn create_session(
@@ -707,9 +830,8 @@ async fn list_questions(
     let session = find_session_by_code(&state.db, &code).await?;
 
     let raw_sort = query.sort.as_deref().unwrap_or("top");
-    let sort = QuestionSort::parse(raw_sort).ok_or_else(|| {
-        AppError::bad_request("sort must be 'top', 'new', or 'answered'")
-    })?;
+    let sort = QuestionSort::parse(raw_sort)
+        .ok_or_else(|| AppError::bad_request("sort must be 'top', 'new', or 'answered'"))?;
 
     let questions = list_questions_for_session(&state.db, session.id, sort).await?;
 
@@ -963,7 +1085,10 @@ async fn vote_question(
     .map_err(|err| AppError::internal(format!("failed to check vote rate limit: {err}")))?;
 
     if vote_count >= 200 {
-        tracing::warn!(user_id = auth.user_id, "vote rate limit hit ({vote_count}/min)");
+        tracing::warn!(
+            user_id = auth.user_id,
+            "vote rate limit hit ({vote_count}/min)"
+        );
         return Err(AppError::too_many_requests(
             "too many votes, please slow down",
         ));
@@ -1071,7 +1196,11 @@ async fn moderate_question(
             }
 
             let question = fetch_question_by_id(&state.db, question_id).await?;
-            tracing::info!(question_id, user_id = auth.user_id, "question marked answering");
+            tracing::info!(
+                question_id,
+                user_id = auth.user_id,
+                "question marked answering"
+            );
             state
                 .session_events
                 .publish(meta.session_id, SessionEvent::question_changed(question_id))
@@ -1129,9 +1258,7 @@ async fn moderate_question(
             .bind(question_id)
             .execute(&state.db)
             .await
-            .map_err(|err| {
-                AppError::internal(format!("failed to reject question: {err}"))
-            })?;
+            .map_err(|err| AppError::internal(format!("failed to reject question: {err}")))?;
 
             if update.rows_affected() == 0 {
                 return Err(AppError::bad_request(
@@ -1379,62 +1506,102 @@ fn build_public_session_url(base: &str, code: &str) -> String {
     format!("{}/s/{code}", base.trim_end_matches('/'))
 }
 
-async fn verify_hcaptcha(
-    state: &AppState,
-    token: &str,
-    remote_ip: Option<String>,
-) -> Result<(), AppError> {
-    if state.hcaptcha_skip_verify {
-        return Ok(());
-    }
+async fn create_auth_session(db: &SqlitePool, user_id: i64) -> Result<String, AppError> {
+    let auth_token = format!("{}{}", Uuid::new_v4(), Uuid::new_v4().simple());
+    let token_hash = hash_token(&auth_token);
 
-    let secret = state
-        .hcaptcha_secret
-        .as_deref()
-        .ok_or_else(|| AppError::internal("HCAPTCHA_SECRET is not configured"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO auth_sessions (user_id, token_hash, created_at, last_seen_at)
+        VALUES (?1, ?2, unixepoch(), unixepoch());
+        "#,
+    )
+    .bind(user_id)
+    .bind(token_hash)
+    .execute(db)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to create auth session: {err}")))?;
 
-    let mut form: Vec<(String, String)> = vec![
-        ("secret".to_string(), secret.to_string()),
-        ("response".to_string(), token.to_string()),
-    ];
+    Ok(auth_token)
+}
 
-    if let Some(ip) = remote_ip {
-        form.push(("remoteip".to_string(), ip));
-    }
-    if let Some(site_key) = state.hcaptcha_site_key.as_deref() {
-        form.push(("sitekey".to_string(), site_key.to_string()));
-    }
-
-    let verify = state
-        .http
-        .post("https://api.hcaptcha.com/siteverify")
-        .form(&form)
-        .send()
+async fn consume_oauth_state(db: &SqlitePool, state_token: &str) -> Result<String, AppError> {
+    let mut tx = db
+        .begin()
         .await
-        .map_err(|err| AppError::internal(format!("hcaptcha request failed: {err}")))?;
+        .map_err(|err| AppError::internal(format!("failed to start oauth state tx: {err}")))?;
 
-    if !verify.status().is_success() {
-        return Err(AppError::internal(format!(
-            "hcaptcha returned unexpected status: {}",
-            verify.status()
-        )));
-    }
+    let return_to: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT return_to
+        FROM oauth_login_states
+        WHERE state = ?1 AND expires_at > unixepoch()
+        LIMIT 1;
+        "#,
+    )
+    .bind(state_token)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to read oauth state: {err}")))?;
 
-    let body: HcaptchaVerifyResponse = verify
-        .json()
+    sqlx::query("DELETE FROM oauth_login_states WHERE state = ?1;")
+        .bind(state_token)
+        .execute(&mut *tx)
         .await
-        .map_err(|err| AppError::internal(format!("invalid hcaptcha response: {err}")))?;
+        .map_err(|err| AppError::internal(format!("failed to consume oauth state: {err}")))?;
 
-    if !body.success {
-        let details = if body.error_codes.is_empty() {
-            "unknown hcaptcha error".to_string()
-        } else {
-            body.error_codes.join(", ")
-        };
-        return Err(AppError::unauthorized(format!(
-            "hcaptcha validation failed: {details}"
-        )));
+    tx.commit()
+        .await
+        .map_err(|err| AppError::internal(format!("failed to commit oauth state tx: {err}")))?;
+
+    return_to.ok_or_else(|| AppError::unauthorized("invalid or expired oauth state"))
+}
+
+fn sanitize_return_to(raw: Option<&str>) -> String {
+    let candidate = raw.unwrap_or("/");
+    if candidate.len() > 2048 {
+        return "/".to_string();
+    }
+    if !candidate.starts_with('/') || candidate.starts_with("//") {
+        return "/".to_string();
     }
 
-    Ok(())
+    let without_fragment = candidate.split('#').next().unwrap_or("/");
+    if without_fragment.is_empty() {
+        "/".to_string()
+    } else {
+        without_fragment.to_string()
+    }
+}
+
+fn normalize_google_name(raw: Option<&str>) -> String {
+    let trimmed = raw.unwrap_or("").trim();
+    if trimmed.is_empty() {
+        return "google_user".to_string();
+    }
+
+    let mut normalized = String::new();
+    for ch in trimmed.chars().take(64) {
+        if ch.is_control() {
+            continue;
+        }
+        normalized.push(ch);
+    }
+
+    let final_name = normalized.trim();
+    if final_name.is_empty() {
+        "google_user".to_string()
+    } else {
+        final_name.to_string()
+    }
+}
+
+fn redirect_with_fragment(return_to: &str, key: &str, value: Option<&str>) -> Redirect {
+    let path = sanitize_return_to(Some(return_to));
+    let target = if let Some(value) = value {
+        format!("{path}#{key}={value}")
+    } else {
+        format!("{path}#auth_error={key}")
+    };
+    Redirect::to(&target)
 }

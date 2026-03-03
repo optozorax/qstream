@@ -2,19 +2,22 @@
 
 MVP for streamer Q&A:
 - `backend`: Rust + Axum API with SQLite storage.
-- `frontend`: Svelte single-page app with nickname form + hCaptcha.
+- `frontend`: Svelte single-page app with Google OAuth login.
 
 ## Implemented backend API
 
 ### Auth / login
-- `POST /api/register`
-  - body: `{ "nickname": "...", "hcaptcha_token": "..." }`
-  - validates hCaptcha
-  - creates/updates user
+- `GET /api/google_oauth2/start?return_to=/optional/path`
+  - starts Google OAuth flow
+  - stores one-time oauth state
+  - redirects to Google consent page with `openid profile`
+- `GET /api/google_oauth2`
+  - Google callback endpoint
+  - exchanges code for token, loads Google profile, creates/updates user
   - creates auth session
-  - returns: `{ user, auth_token, session }`
+  - redirects back to `return_to` with `#auth_token=...`
 
-Use returned token in header:
+Use returned token in header (`auth_token` from URL fragment after OAuth callback):
 - `Authorization: Bearer <auth_token>`
 
 ### Sessions
@@ -81,9 +84,9 @@ Default env values:
 - `FRONTEND_ORIGIN=http://localhost:5173`
 - `PUBLIC_BASE_URL=http://localhost:5173`
 - `DATABASE_URL=sqlite://qstream.db?mode=rwc`
-- `HCAPTCHA_SITE_KEY=...`
-- `HCAPTCHA_SECRET=...`
-- `HCAPTCHA_SKIP_VERIFY=false`
+- `GOOGLE_CLIENT_ID=...`
+- `GOOGLE_CLIENT_SECRET=...`
+- `GOOGLE_REDIRECT_URI=http://localhost:3000/api/google_oauth2`
 - `RESET_DB_ON_BOOT=false`
 
 If `RESET_DB_ON_BOOT=true`, backend drops and recreates all tables at startup.
@@ -108,7 +111,7 @@ npm run dev
 
 Frontend env:
 - `VITE_API_BASE_URL=http://localhost:3000`
-- `VITE_HCAPTCHA_SITE_KEY=...`
+- `VITE_ALLOWED_HOSTS=`
 
 ## Run on a real public HTTPS domain through SSH tunnel
 
@@ -122,6 +125,9 @@ SSH_KEY_PATH=<path_to_private_key>
 PUBLIC_HOST=<public_https_host>
 REMOTE_FRONTEND_INTERNAL_PORT=45173
 REMOTE_BACKEND_INTERNAL_PORT=43000
+GOOGLE_CLIENT_ID=<google_client_id>
+GOOGLE_CLIENT_SECRET=<google_client_secret>
+GOOGLE_REDIRECT_URI=https://<public_https_host>/api/google_oauth2
 ```
 
 Start from `.env.local.example` and fill your local values.
@@ -150,7 +156,7 @@ How it works:
 ## Frontend behavior
 
 - `/` (main page):
-  - login with nickname + hCaptcha
+  - login via `Continue with Google`
   - create one session (`Create` button)
   - open current session link
 - `/s/:code` (public session page):
@@ -161,7 +167,7 @@ How it works:
   - in `manual` mode, `Update now` shows pending new-question count from SSE notifications
   - logged-in non-owner viewers can toggle `Hide interacted` to filter out questions they already voted on or asked
   - default update mode: stream owner -> auto, non-logged guest -> auto, logged non-owner viewer -> manual
-  - `Login` button (nickname + hCaptcha)
+  - `Log in` button opens `Continue with Google`
   - after login (non-owner): can submit question and vote `Like/Dislike` (voting disabled for answered/in-progress)
   - stream owner cannot vote
   - stream owner cannot submit questions

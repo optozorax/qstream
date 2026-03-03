@@ -351,6 +351,11 @@ textarea:focus {
   opacity: 0.7;
 }
 
+.q-card.rejected {
+  border-color: var(--red-border);
+  opacity: 0.7;
+}
+
 .q-vote-col {
   display: flex;
   flex-direction: column;
@@ -465,6 +470,12 @@ textarea:focus {
   background: var(--green-soft);
   color: var(--green);
   border: 1px solid var(--green-border);
+}
+
+.badge-rejected {
+  background: var(--red-soft);
+  color: var(--red);
+  border: 1px solid var(--red-border);
 }
 
 /* -- Status indicator -- */

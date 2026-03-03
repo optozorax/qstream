@@ -32,7 +32,7 @@ During live streams, chat is noisy and fast. Good questions get lost quickly, an
 4. Viewer opens link, passes hCaptcha, enters nickname.
 5. Viewer submits questions.
 6. All viewers see questions and vote (upvote/downvote).
-7. Streamer sorts feed by latest/top/hot.
+7. Streamer sorts feed by latest/top.
 8. Streamer marks questions as answered, hides/rejects, or bans abusive users.
 
 ## MVP Features
@@ -42,7 +42,7 @@ During live streams, chat is noisy and fast. Good questions get lost quickly, an
 - Upvote/downvote per question.
 - Real-time feed updates.
 - Basic moderation: answered, hidden/rejected, ban.
-- Sorting modes: `new`, `top`, `hot`.
+- Sorting modes: `new`, `top`.
 
 ## Suggested Data Model
 - `stream_sessions`: stream room and state.
@@ -86,6 +86,7 @@ Use Server-Sent Events (SSE) for fan-out updates (new question, vote changes, mo
 - Complex role hierarchy.
 - Enterprise analytics.
 - Heavy distributed infrastructure.
+- Pagination for question lists (future enhancement).
 
 ## Definition of Success
 During a live stream, the streamer can reliably see and answer the highest-value audience questions without chat chaos.

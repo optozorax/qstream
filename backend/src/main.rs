@@ -17,13 +17,14 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     env,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_stream::{wrappers::BroadcastStream, Stream, StreamExt};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -36,6 +37,7 @@ struct AppState {
     hcaptcha_skip_verify: bool,
     public_base_url: String,
     session_events: SessionEventBus,
+    sse_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
 }
 
 #[derive(Clone, Default)]
@@ -59,6 +61,16 @@ impl SessionEventBus {
             .entry(session_id)
             .or_insert_with(|| broadcast::channel(256).0)
             .clone()
+    }
+
+    async fn cleanup(&self) {
+        let mut channels = self.channels.write().await;
+        let before = channels.len();
+        channels.retain(|_, sender| sender.receiver_count() > 0);
+        let removed = before - channels.len();
+        if removed > 0 {
+            tracing::debug!(removed, remaining = channels.len(), "cleaned up idle SSE channels");
+        }
     }
 }
 
@@ -194,8 +206,8 @@ struct ModerateQuestionRequest {
 struct User {
     id: i64,
     nickname: String,
-    created_at: String,
-    last_login_at: String,
+    created_at: i64,
+    last_login_at: i64,
 }
 
 #[derive(Serialize, FromRow)]
@@ -216,6 +228,8 @@ struct QuestionView {
     body: String,
     is_answering: i64,
     is_answered: i64,
+    is_rejected: i64,
+    is_deleted: i64,
     created_at: i64,
     score: i64,
     votes_count: i64,
@@ -283,6 +297,34 @@ struct QuestionVoteMeta {
     owner_user_id: i64,
     is_answering: i64,
     is_answered: i64,
+    is_rejected: i64,
+    is_deleted: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuestionSort {
+    Top,
+    New,
+    Answered,
+}
+
+impl QuestionSort {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "top" | "popular" => Some(Self::Top),
+            "new" => Some(Self::New),
+            "answered" => Some(Self::Answered),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::New => "new",
+            Self::Answered => "answered",
+        }
+    }
 }
 
 #[tokio::main]
@@ -290,7 +332,9 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let mut db_url =
@@ -318,13 +362,45 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
 
+    tracing::info!(
+        db = %db_url,
+        addr = %app_addr,
+        frontend_origin = %frontend_origin,
+        hcaptcha_skip = hcaptcha_skip_verify,
+        reset_db = reset_db_on_boot,
+        "starting qstream backend"
+    );
+
     let db = SqlitePoolOptions::new()
         .max_connections(5)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
         .connect(&db_url)
         .await
         .with_context(|| format!("failed to connect to database: {db_url}"))?;
 
+    tracing::info!("connected to database");
     init_db(&db, reset_db_on_boot).await?;
+    tracing::info!(reset = reset_db_on_boot, "database schema ready");
+
+    let session_events = SessionEventBus::default();
+
+    // Spawn cleanup task for session event channels
+    {
+        let bus = session_events.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                bus.cleanup().await;
+            }
+        });
+    }
 
     let state = AppState {
         db,
@@ -333,22 +409,27 @@ async fn main() -> anyhow::Result<()> {
         hcaptcha_site_key,
         hcaptcha_skip_verify,
         public_base_url,
-        session_events: SessionEventBus::default(),
+        session_events,
+        sse_connections: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    let cors = CorsLayer::new()
-        .allow_origin(
+    let cors = if frontend_origin == "*" {
+        CorsLayer::new().allow_origin(Any)
+    } else {
+        CorsLayer::new().allow_origin(
             HeaderValue::from_str(&frontend_origin)
                 .with_context(|| format!("invalid FRONTEND_ORIGIN: {frontend_origin}"))?,
         )
+    }
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
     let app = Router::new()
         .route("/api/health", get(health))
+        .route("/api/me", get(get_me))
         .route("/api/register", post(register))
         .route("/api/sessions", post(create_session))
-        .route("/api/sessions/:code/events", get(session_events))
+        .route("/api/sessions/:code/events", get(session_events_handler))
         .route(
             "/api/sessions/:code/questions",
             get(list_questions).post(create_question),
@@ -356,7 +437,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/questions/:id/vote", post(vote_question))
         .route("/api/questions/:id/moderate", post(moderate_question))
         .with_state(state)
-        .layer(cors);
+        .layer(cors)
+        .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = app_addr
         .parse()
@@ -371,6 +453,9 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(async {
+        tokio::signal::ctrl_c().await.ok();
+    })
     .await?;
 
     Ok(())
@@ -392,6 +477,33 @@ async fn init_db(db: &SqlitePool, reset_db_on_boot: bool) -> anyhow::Result<()> 
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { ok: true })
+}
+
+async fn get_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<User>, AppError> {
+    let auth = require_auth_user(&state, &headers).await?;
+
+    let user = sqlx::query_as::<_, User>(
+        r#"
+        SELECT
+            id,
+            nickname,
+            CAST(created_at AS INTEGER) AS created_at,
+            CAST(last_login_at AS INTEGER) AS last_login_at
+        FROM users
+        WHERE id = ?1
+        LIMIT 1;
+        "#,
+    )
+    .bind(auth.user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to fetch auth user: {err}")))?
+    .ok_or_else(|| AppError::unauthorized("invalid or expired token"))?;
+
+    Ok(Json(user))
 }
 
 async fn register(
@@ -417,28 +529,33 @@ async fn register(
     )
     .await?;
 
-    sqlx::query(
+    tracing::info!(ip = %addr.ip(), nickname, "registering new user");
+
+    // Always insert a new user (nicknames are not unique)
+    let user_id: i64 = sqlx::query_scalar(
         r#"
         INSERT INTO users (nickname, last_login_at, last_hcaptcha_at)
-        VALUES (?1, datetime('now'), datetime('now'))
-        ON CONFLICT(nickname) DO UPDATE
-        SET last_login_at = datetime('now'),
-            last_hcaptcha_at = datetime('now');
+        VALUES (?1, unixepoch(), unixepoch())
+        RETURNING id;
         "#,
     )
     .bind(nickname)
-    .execute(&state.db)
+    .fetch_one(&state.db)
     .await
     .map_err(|err| AppError::internal(format!("failed to save user: {err}")))?;
 
     let user = sqlx::query_as::<_, User>(
         r#"
-        SELECT id, nickname, created_at, last_login_at
+        SELECT
+            id,
+            nickname,
+            CAST(created_at AS INTEGER) AS created_at,
+            CAST(last_login_at AS INTEGER) AS last_login_at
         FROM users
-        WHERE nickname = ?1;
+        WHERE id = ?1;
         "#,
     )
-    .bind(nickname)
+    .bind(user_id)
     .fetch_one(&state.db)
     .await
     .map_err(|err| AppError::internal(format!("failed to fetch user: {err}")))?;
@@ -460,7 +577,12 @@ async fn register(
 
     let session = sqlx::query_as::<_, StreamSession>(
         r#"
-        SELECT id, owner_user_id, public_code, created_at, is_active
+        SELECT
+            id,
+            owner_user_id,
+            public_code,
+            CAST(created_at AS INTEGER) AS created_at,
+            is_active
         FROM stream_sessions
         WHERE owner_user_id = ?1
         LIMIT 1;
@@ -471,6 +593,7 @@ async fn register(
     .await
     .map_err(|err| AppError::internal(format!("failed to query stream session: {err}")))?;
 
+    tracing::info!(user_id = user.id, nickname = %user.nickname, "user registered");
     Ok(Json(RegisterResponse {
         user,
         auth_token,
@@ -486,7 +609,12 @@ async fn create_session(
 
     if let Some(existing) = sqlx::query_as::<_, StreamSession>(
         r#"
-        SELECT id, owner_user_id, public_code, created_at, is_active
+        SELECT
+            id,
+            owner_user_id,
+            public_code,
+            CAST(created_at AS INTEGER) AS created_at,
+            is_active
         FROM stream_sessions
         WHERE owner_user_id = ?1
         LIMIT 1;
@@ -497,6 +625,7 @@ async fn create_session(
     .await
     .map_err(|err| AppError::internal(format!("failed to query stream session: {err}")))?
     {
+        tracing::info!(user_id = auth.user_id, code = %existing.public_code, "returning existing session");
         return Ok(Json(CreateSessionResponse {
             public_url: build_public_session_url(&state.public_base_url, &existing.public_code),
             session: existing,
@@ -522,7 +651,12 @@ async fn create_session(
             Ok(_) => {
                 let session = sqlx::query_as::<_, StreamSession>(
                     r#"
-                    SELECT id, owner_user_id, public_code, created_at, is_active
+                    SELECT
+                        id,
+                        owner_user_id,
+                        public_code,
+                        CAST(created_at AS INTEGER) AS created_at,
+                        is_active
                     FROM stream_sessions
                     WHERE owner_user_id = ?1
                     LIMIT 1;
@@ -557,6 +691,7 @@ async fn create_session(
     let session =
         inserted.ok_or_else(|| AppError::internal("failed to generate unique session code"))?;
 
+    tracing::info!(user_id = auth.user_id, code = %session.public_code, "session created");
     Ok(Json(CreateSessionResponse {
         public_url: build_public_session_url(&state.public_base_url, &session.public_code),
         session,
@@ -571,34 +706,46 @@ async fn list_questions(
 ) -> Result<Json<ListQuestionsResponse>, AppError> {
     let session = find_session_by_code(&state.db, &code).await?;
 
-    let requested_sort = query.sort.unwrap_or_else(|| "top".to_string());
-    let sort = if requested_sort == "popular" {
-        "top".to_string()
-    } else {
-        requested_sort
-    };
+    let raw_sort = query.sort.as_deref().unwrap_or("top");
+    let sort = QuestionSort::parse(raw_sort).ok_or_else(|| {
+        AppError::bad_request("sort must be 'top', 'new', or 'answered'")
+    })?;
 
-    if sort != "top" && sort != "new" && sort != "answered" {
-        return Err(AppError::bad_request(
-            "sort must be 'top', 'new', or 'answered'",
-        ));
-    }
-
-    let questions = list_questions_for_session(&state.db, session.id, &sort).await?;
+    let questions = list_questions_for_session(&state.db, session.id, sort).await?;
 
     Ok(Json(ListQuestionsResponse {
         session,
-        sort,
+        sort: sort.as_str().to_string(),
         questions,
     }))
 }
 
-async fn session_events(
+async fn session_events_handler(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(code): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     let session = find_session_by_code(&state.db, &code).await?;
+
+    // Per-IP SSE connection limit
+    let ip = addr.ip();
+    {
+        let mut conns = state.sse_connections.lock().await;
+        let count = conns.entry(ip).or_insert(0);
+        if *count >= 3 {
+            tracing::warn!(ip = %ip, code = %code, "SSE connection limit reached");
+            return Err(AppError::too_many_requests(
+                "too many SSE connections from this IP",
+            ));
+        }
+        *count += 1;
+        tracing::info!(ip = %ip, code = %code, connections = *count, "SSE client connected");
+    }
+
     let receiver = state.session_events.subscribe(session.id).await;
+
+    // Clone for the drop guard
+    let sse_connections = state.sse_connections.clone();
 
     let stream = BroadcastStream::new(receiver).filter_map(|message| {
         let event = match message {
@@ -618,11 +765,59 @@ async fn session_events(
         }
     });
 
+    // Wrap stream to decrement connection count on drop
+    let stream = SseDropGuard {
+        inner: Box::pin(stream),
+        sse_connections,
+        ip,
+        decremented: false,
+    };
+
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("keepalive"),
     ))
+}
+
+/// A stream wrapper that decrements the SSE connection count when dropped.
+struct SseDropGuard<S> {
+    inner: std::pin::Pin<Box<S>>,
+    sse_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+    decremented: bool,
+}
+
+impl<S: Stream<Item = Result<Event, Infallible>>> Stream for SseDropGuard<S> {
+    type Item = Result<Event, Infallible>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+impl<S> Drop for SseDropGuard<S> {
+    fn drop(&mut self) {
+        if !self.decremented {
+            self.decremented = true;
+            let conns = self.sse_connections.clone();
+            let ip = self.ip;
+            tokio::spawn(async move {
+                let mut conns = conns.lock().await;
+                if let Some(count) = conns.get_mut(&ip) {
+                    *count = count.saturating_sub(1);
+                    let remaining = *count;
+                    if remaining == 0 {
+                        conns.remove(&ip);
+                    }
+                    tracing::info!(ip = %ip, connections = remaining, "SSE client disconnected");
+                }
+            });
+        }
+    }
 }
 
 async fn create_question(
@@ -652,10 +847,10 @@ async fn create_question(
 
     let last_question_at: Option<i64> = sqlx::query_scalar(
         r#"
-        SELECT created_at
+        SELECT CAST(created_at AS INTEGER)
         FROM questions
         WHERE session_id = ?1 AND author_user_id = ?2
-        ORDER BY created_at DESC
+        ORDER BY CAST(created_at AS INTEGER) DESC
         LIMIT 1;
         "#,
     )
@@ -668,6 +863,7 @@ async fn create_question(
     if let Some(last_ts) = last_question_at {
         let now = now_unix();
         if now - last_ts < 60 {
+            tracing::warn!(user_id = auth.user_id, session = %code, "question rate limit hit");
             return Err(AppError::too_many_requests(
                 "you can post only one question per minute",
             ));
@@ -689,6 +885,13 @@ async fn create_question(
 
     let question_id = insert.last_insert_rowid();
     let question = fetch_question_by_id(&state.db, question_id).await?;
+    tracing::info!(
+        question_id,
+        user_id = auth.user_id,
+        session = %code,
+        chars = text_len,
+        "question created"
+    );
     state
         .session_events
         .publish(session.id, SessionEvent::question_created(question_id))
@@ -711,7 +914,7 @@ async fn vote_question(
 
     let question_meta = sqlx::query_as::<_, QuestionVoteMeta>(
         r#"
-        SELECT q.session_id, s.owner_user_id, q.is_answering, q.is_answered
+        SELECT q.session_id, s.owner_user_id, q.is_answering, q.is_answered, q.is_rejected, q.is_deleted
         FROM questions q
         JOIN stream_sessions s ON s.id = q.session_id
         WHERE q.id = ?1;
@@ -735,8 +938,35 @@ async fn vote_question(
         ));
     }
 
+    if question_meta.is_rejected == 1 {
+        return Err(AppError::bad_request("cannot vote for rejected questions"));
+    }
+
+    if question_meta.is_deleted == 1 {
+        return Err(AppError::bad_request("cannot vote for deleted questions"));
+    }
+
     if is_user_banned(&state.db, question_meta.session_id, auth.user_id).await? {
         return Err(AppError::forbidden("you are banned in this session"));
+    }
+
+    // Vote rate limiting: max 200 votes per minute
+    let vote_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*) FROM votes
+        WHERE user_id = ?1 AND updated_at > unixepoch() - 60;
+        "#,
+    )
+    .bind(auth.user_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to check vote rate limit: {err}")))?;
+
+    if vote_count >= 200 {
+        tracing::warn!(user_id = auth.user_id, "vote rate limit hit ({vote_count}/min)");
+        return Err(AppError::too_many_requests(
+            "too many votes, please slow down",
+        ));
     }
 
     sqlx::query(
@@ -767,6 +997,13 @@ async fn vote_question(
     .await
     .map_err(|err| AppError::internal(format!("failed to recalculate score: {err}")))?;
 
+    tracing::info!(
+        question_id,
+        user_id = auth.user_id,
+        value = payload.value,
+        score,
+        "vote recorded"
+    );
     state
         .session_events
         .publish(
@@ -834,6 +1071,7 @@ async fn moderate_question(
             }
 
             let question = fetch_question_by_id(&state.db, question_id).await?;
+            tracing::info!(question_id, user_id = auth.user_id, "question marked answering");
             state
                 .session_events
                 .publish(meta.session_id, SessionEvent::question_changed(question_id))
@@ -868,6 +1106,41 @@ async fn moderate_question(
             }
 
             let question = fetch_question_by_id(&state.db, question_id).await?;
+            tracing::info!(question_id, user_id = auth.user_id, "question answered");
+            state
+                .session_events
+                .publish(meta.session_id, SessionEvent::question_changed(question_id))
+                .await;
+
+            Ok(Json(ModerateQuestionResponse {
+                question_id,
+                deleted: false,
+                question: Some(question),
+            }))
+        }
+        "reject" => {
+            let update = sqlx::query(
+                r#"
+                UPDATE questions
+                SET is_rejected = 1
+                WHERE id = ?1 AND is_answered = 0 AND is_rejected = 0;
+                "#,
+            )
+            .bind(question_id)
+            .execute(&state.db)
+            .await
+            .map_err(|err| {
+                AppError::internal(format!("failed to reject question: {err}"))
+            })?;
+
+            if update.rows_affected() == 0 {
+                return Err(AppError::bad_request(
+                    "cannot reject: question is already answered or rejected",
+                ));
+            }
+
+            let question = fetch_question_by_id(&state.db, question_id).await?;
+            tracing::info!(question_id, user_id = auth.user_id, "question rejected");
             state
                 .session_events
                 .publish(meta.session_id, SessionEvent::question_changed(question_id))
@@ -880,9 +1153,11 @@ async fn moderate_question(
             }))
         }
         "delete" => {
+            // Soft-delete: set is_deleted = 1 instead of removing from DB
             sqlx::query(
                 r#"
-                DELETE FROM questions
+                UPDATE questions
+                SET is_deleted = 1
                 WHERE id = ?1;
                 "#,
             )
@@ -890,6 +1165,7 @@ async fn moderate_question(
             .execute(&state.db)
             .await
             .map_err(|err| AppError::internal(format!("failed to delete question: {err}")))?;
+            tracing::info!(question_id, user_id = auth.user_id, "question soft-deleted");
             state
                 .session_events
                 .publish(meta.session_id, SessionEvent::question_deleted(question_id))
@@ -902,7 +1178,7 @@ async fn moderate_question(
             }))
         }
         _ => Err(AppError::bad_request(
-            "action must be one of: answer, finish_answering, delete",
+            "action must be one of: answer, finish_answering, reject, delete",
         )),
     }
 }
@@ -946,7 +1222,12 @@ async fn require_auth_user(state: &AppState, headers: &HeaderMap) -> Result<Auth
 async fn find_session_by_code(db: &SqlitePool, code: &str) -> Result<StreamSession, AppError> {
     sqlx::query_as::<_, StreamSession>(
         r#"
-        SELECT id, owner_user_id, public_code, created_at, is_active
+        SELECT
+            id,
+            owner_user_id,
+            public_code,
+            CAST(created_at AS INTEGER) AS created_at,
+            is_active
         FROM stream_sessions
         WHERE public_code = ?1 AND is_active = 1
         LIMIT 1;
@@ -962,19 +1243,21 @@ async fn find_session_by_code(db: &SqlitePool, code: &str) -> Result<StreamSessi
 async fn list_questions_for_session(
     db: &SqlitePool,
     session_id: i64,
-    sort: &str,
+    sort: QuestionSort,
 ) -> Result<Vec<QuestionView>, AppError> {
-    let order_by = if sort == "new" {
-        "q.is_answering DESC, q.created_at DESC"
-    } else if sort == "answered" {
-        "q.created_at DESC"
-    } else {
-        "q.is_answering DESC, score DESC, q.created_at DESC"
-    };
-    let answered_filter = if sort == "answered" {
-        "q.is_answered = 1"
-    } else {
-        "q.is_answered = 0"
+    let (filter, order_by) = match sort {
+        QuestionSort::Answered => (
+            "WHERE q.session_id = ?1 AND (q.is_answered = 1 OR q.is_rejected = 1) AND q.is_deleted = 0",
+            "ORDER BY CAST(q.created_at AS INTEGER) DESC",
+        ),
+        QuestionSort::New => (
+            "WHERE q.session_id = ?1 AND q.is_answered = 0 AND q.is_rejected = 0 AND q.is_deleted = 0",
+            "ORDER BY q.is_answering DESC, CAST(q.created_at AS INTEGER) DESC",
+        ),
+        QuestionSort::Top => (
+            "WHERE q.session_id = ?1 AND q.is_answered = 0 AND q.is_rejected = 0 AND q.is_deleted = 0",
+            "ORDER BY q.is_answering DESC, score DESC, CAST(q.created_at AS INTEGER) DESC",
+        ),
     };
 
     let sql = format!(
@@ -987,15 +1270,17 @@ async fn list_questions_for_session(
             q.body,
             q.is_answering,
             q.is_answered,
-            q.created_at,
+            q.is_rejected,
+            q.is_deleted,
+            CAST(q.created_at AS INTEGER) AS created_at,
             COALESCE(SUM(v.value), 0) AS score,
             COALESCE(COUNT(v.user_id), 0) AS votes_count
         FROM questions q
         JOIN users u ON u.id = q.author_user_id
         LEFT JOIN votes v ON v.question_id = q.id
-        WHERE q.session_id = ?1 AND {answered_filter}
-        GROUP BY q.id, q.session_id, q.author_user_id, u.nickname, q.body, q.is_answering, q.is_answered, q.created_at
-        ORDER BY {order_by};
+        {filter}
+        GROUP BY q.id, q.session_id, q.author_user_id, u.nickname, q.body, q.is_answering, q.is_answered, q.is_rejected, q.is_deleted, q.created_at
+        {order_by};
         "#
     );
 
@@ -1017,14 +1302,16 @@ async fn fetch_question_by_id(db: &SqlitePool, question_id: i64) -> Result<Quest
             q.body,
             q.is_answering,
             q.is_answered,
-            q.created_at,
+            q.is_rejected,
+            q.is_deleted,
+            CAST(q.created_at AS INTEGER) AS created_at,
             COALESCE(SUM(v.value), 0) AS score,
             COALESCE(COUNT(v.user_id), 0) AS votes_count
         FROM questions q
         JOIN users u ON u.id = q.author_user_id
         LEFT JOIN votes v ON v.question_id = q.id
         WHERE q.id = ?1
-        GROUP BY q.id, q.session_id, q.author_user_id, u.nickname, q.body, q.is_answering, q.is_answered, q.created_at
+        GROUP BY q.id, q.session_id, q.author_user_id, u.nickname, q.body, q.is_answering, q.is_answered, q.is_rejected, q.is_deleted, q.created_at
         LIMIT 1;
         "#,
     )

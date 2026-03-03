@@ -1,11 +1,9 @@
-PRAGMA foreign_keys = ON;
-
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    nickname TEXT NOT NULL UNIQUE,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    last_login_at TEXT NOT NULL DEFAULT (datetime('now')),
-    last_hcaptcha_at TEXT NOT NULL DEFAULT (datetime('now'))
+    nickname TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    last_login_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    last_hcaptcha_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
 CREATE TABLE IF NOT EXISTS auth_sessions (
@@ -35,6 +33,8 @@ CREATE TABLE IF NOT EXISTS questions (
     body TEXT NOT NULL CHECK (length(body) BETWEEN 1 AND 300),
     is_answering INTEGER NOT NULL DEFAULT 0 CHECK (is_answering IN (0, 1)),
     is_answered INTEGER NOT NULL DEFAULT 0 CHECK (is_answered IN (0, 1)),
+    is_rejected INTEGER NOT NULL DEFAULT 0 CHECK (is_rejected IN (0, 1)),
+    is_deleted INTEGER NOT NULL DEFAULT 0 CHECK (is_deleted IN (0, 1)),
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
@@ -56,6 +56,9 @@ CREATE TABLE IF NOT EXISTS votes (
 
 CREATE INDEX IF NOT EXISTS idx_votes_question
     ON votes(question_id);
+
+CREATE INDEX IF NOT EXISTS idx_votes_user_rate_limit
+    ON votes(user_id, updated_at);
 
 CREATE TABLE IF NOT EXISTS bans (
     session_id INTEGER NOT NULL REFERENCES stream_sessions(id) ON DELETE CASCADE,

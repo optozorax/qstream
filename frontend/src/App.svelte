@@ -2,7 +2,29 @@
   import { onDestroy, onMount } from 'svelte'
   import LoginPanel from './lib/LoginPanel.svelte'
 
-  const apiBase = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3000'
+  const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '0.0.0.0'])
+
+  function resolveApiBase(rawApiBase) {
+    const fallback = `${window.location.protocol}//${window.location.hostname}:3000`
+    if (!rawApiBase) {
+      return fallback
+    }
+
+    try {
+      const url = new URL(rawApiBase)
+      if (
+        LOCAL_HOSTNAMES.has(url.hostname) &&
+        !LOCAL_HOSTNAMES.has(window.location.hostname)
+      ) {
+        url.hostname = window.location.hostname
+      }
+      return url.toString().replace(/\/$/, '')
+    } catch {
+      return rawApiBase.replace(/\/$/, '')
+    }
+  }
+
+  const apiBase = resolveApiBase(import.meta.env.VITE_API_BASE_URL)
   const siteKey = import.meta.env.VITE_HCAPTCHA_SITE_KEY ?? ''
 
   const AUTH_TOKEN_KEY = 'qstream_auth_token'
@@ -52,6 +74,8 @@
       : questions
 
   onMount(() => {
+    void validateStoredAuth()
+
     const onPopState = () => {
       route = parseRoute(window.location.pathname)
     }
@@ -117,7 +141,11 @@
 
   function setSessionCode(code) {
     storedSessionCode = code
-    localStorage.setItem(SESSION_CODE_KEY, code)
+    if (code) {
+      localStorage.setItem(SESSION_CODE_KEY, code)
+    } else {
+      localStorage.removeItem(SESSION_CODE_KEY)
+    }
   }
 
   function setOwnSessionCode(code) {
@@ -232,9 +260,26 @@
     localVotes = {}
     interactedQuestionIds = new Set()
     hideInteracted = false
+    setSessionCode('')
     setOwnSessionCode('')
     localStorage.removeItem(AUTH_TOKEN_KEY)
     localStorage.removeItem(USER_KEY)
+  }
+
+  function isUnauthorizedApiError(error) {
+    return !!error && typeof error === 'object' && error.status === 401
+  }
+
+  function handleAuthInvalid() {
+    if (!authToken && !currentUser) {
+      return
+    }
+
+    logout()
+
+    if (route.name === 'session') {
+      showSessionLogin = true
+    }
   }
 
   function goto(path) {
@@ -263,10 +308,40 @@
 
     const payload = await response.json().catch(() => ({}))
     if (!response.ok) {
-      throw new Error(payload.error ?? `Request failed with status ${response.status}`)
+      if (options.auth && response.status === 401) {
+        handleAuthInvalid()
+      }
+
+      const error = new Error(payload.error ?? `Request failed with status ${response.status}`)
+      error.status = response.status
+      throw error
     }
 
     return payload
+  }
+
+  async function validateStoredAuth() {
+    if (!authToken || !currentUser) {
+      return
+    }
+
+    try {
+      const user = await apiRequest('/api/me', { auth: true })
+      if (user && typeof user === 'object') {
+        currentUser = user
+        localStorage.setItem(USER_KEY, JSON.stringify(currentUser))
+      }
+    } catch (error) {
+      if (!isUnauthorizedApiError(error)) {
+        return
+      }
+
+      if (route.name === 'home') {
+        homeMessage = 'Saved login expired. Please log in again.'
+      } else {
+        questionStatus = 'Saved login expired. Please log in again.'
+      }
+    }
   }
 
   async function createSession() {
@@ -574,13 +649,15 @@
       })
 
       if (payload.deleted) {
-        questions = questions.filter((question) => question.id !== questionId)
         questionStatus = 'Question deleted.'
+        await refreshQuestions()
       } else if (payload.question) {
         if (action === 'answer') {
           questionStatus = 'Question is now in progress.'
         } else if (action === 'finish_answering') {
           questionStatus = 'Question moved to answered.'
+        } else if (action === 'reject') {
+          questionStatus = 'Question rejected.'
         } else {
           questionStatus = 'Question updated.'
         }
@@ -810,7 +887,7 @@
         {/if}
 
         {#each visibleQuestions as item}
-          <article class="q-card" class:answering={item.is_answering === 1} class:answered={item.is_answered === 1}>
+          <article class="q-card" class:answering={item.is_answering === 1} class:answered={item.is_answered === 1} class:rejected={item.is_rejected === 1}>
             <div class="q-vote-col">
               {#if viewerCanInteract}
                 <button
@@ -818,7 +895,7 @@
                   class="q-vote-btn"
                   class:upvoted={localVotes[item.id] === 1}
                   on:click={() => vote(item.id, 1)}
-                  disabled={voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1}
+                  disabled={voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1 || item.is_rejected === 1}
                   title="Upvote"
                 >&#9650;</button>
               {/if}
@@ -831,7 +908,7 @@
                   class="q-vote-btn"
                   class:downvoted={localVotes[item.id] === -1}
                   on:click={() => vote(item.id, -1)}
-                  disabled={voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1}
+                  disabled={voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1 || item.is_rejected === 1}
                   title="Downvote"
                 >&#9660;</button>
               {/if}
@@ -842,6 +919,8 @@
                 <span class="badge badge-answering">Answering</span>
               {:else if item.is_answered === 1}
                 <span class="badge badge-answered">Answered</span>
+              {:else if item.is_rejected === 1}
+                <span class="badge badge-rejected">Rejected</span>
               {/if}
 
               <p class="q-text">{item.body}</p>
@@ -865,6 +944,14 @@
                     >
                       {item.is_answering === 1 ? 'Done' : 'Answer'}
                     </button>
+                  {/if}
+                  {#if item.is_answered === 0 && item.is_rejected === 0}
+                    <button
+                      type="button"
+                      class="btn btn-danger btn-sm"
+                      on:click={() => moderateQuestion(item.id, 'reject')}
+                      disabled={moderateBusy.has(item.id)}
+                    >Reject</button>
                   {/if}
                   <button
                     type="button"

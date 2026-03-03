@@ -110,6 +110,43 @@ Frontend env:
 - `VITE_API_BASE_URL=http://localhost:3000`
 - `VITE_HCAPTCHA_SITE_KEY=...`
 
+## Run on a real public HTTPS domain through SSH tunnel
+
+This workflow uses a root-level reverse proxy on your VPS (for example Caddy) and a local reverse SSH tunnel.
+
+Put sensitive deployment values into `.env.local` (ignored by git):
+
+```bash
+SSH_TARGET=<ssh_user@vps_host>
+SSH_KEY_PATH=<path_to_private_key>
+PUBLIC_HOST=<public_https_host>
+REMOTE_FRONTEND_INTERNAL_PORT=45173
+REMOTE_BACKEND_INTERNAL_PORT=43000
+```
+
+Start from `.env.local.example` and fill your local values.
+
+One-time remote reverse-proxy setup:
+
+```bash
+./scripts/install-remote-caddy.sh
+```
+
+Daily run (starts backend+frontend locally and opens tunnel):
+
+```bash
+./scripts/run-dev-tunnel.sh
+```
+
+Open:
+- `https://<PUBLIC_HOST>`
+
+How it works:
+- Reverse proxy on VPS listens on `80`/`443` for `PUBLIC_HOST`.
+- Proxy forwards `/api/*` to `127.0.0.1:${REMOTE_BACKEND_INTERNAL_PORT}` on VPS.
+- Proxy forwards all other paths to `127.0.0.1:${REMOTE_FRONTEND_INTERNAL_PORT}` on VPS.
+- Local script keeps SSH reverse forwards from those VPS loopback ports to your local backend/frontend.
+
 ## Frontend behavior
 
 - `/` (main page):

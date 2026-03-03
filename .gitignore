@@ -7,3 +7,5 @@ backend/.env
 frontend/node_modules/
 frontend/dist/
 frontend/.env
+.env.local
+AGENTS.private.md

@@ -4,7 +4,18 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
-LOCAL_ENV_FILE="${LOCAL_ENV_FILE:-${ROOT_DIR}/.env.local}"
+DEFAULT_TUNNEL_ENV_FILE="${ROOT_DIR}/.env.tunnel"
+LEGACY_TUNNEL_ENV_FILE="${ROOT_DIR}/.env.tunnel.local"
+FALLBACK_ENV_FILE="${ROOT_DIR}/.env.local"
+if [[ -n "${LOCAL_ENV_FILE:-}" ]]; then
+  LOCAL_ENV_FILE="${LOCAL_ENV_FILE}"
+elif [[ -f "${DEFAULT_TUNNEL_ENV_FILE}" ]]; then
+  LOCAL_ENV_FILE="${DEFAULT_TUNNEL_ENV_FILE}"
+elif [[ -f "${LEGACY_TUNNEL_ENV_FILE}" ]]; then
+  LOCAL_ENV_FILE="${LEGACY_TUNNEL_ENV_FILE}"
+else
+  LOCAL_ENV_FILE="${FALLBACK_ENV_FILE}"
+fi
 TEMPLATE_DIR="${ROOT_DIR}/deploy/templates"
 TUNNEL_CADDY_TEMPLATE="${TEMPLATE_DIR}/caddy.tunnel.Caddyfile"
 
@@ -29,17 +40,19 @@ Environment variables:
   SSH_TARGET=<ssh_user@vps_host>
   SSH_KEY_PATH=<path_to_private_key>
   PUBLIC_HOST=<public_https_host>
+  TUNNEL_UPSTREAM_HOST=127.0.0.1
   REMOTE_FRONTEND_INTERNAL_PORT=45173
   REMOTE_BACKEND_INTERNAL_PORT=43000
 
 Optional local env file:
-  .env.local (or LOCAL_ENV_FILE=<path>)
+  .env.tunnel (fallback: .env.tunnel.local, .env.local, or LOCAL_ENV_FILE=<path>)
 USAGE
   exit 1
 fi
 
 SSH_KEY_PATH="${SSH_KEY_PATH:-}"
 PUBLIC_HOST="${PUBLIC_HOST:-}"
+TUNNEL_UPSTREAM_HOST="${TUNNEL_UPSTREAM_HOST:-127.0.0.1}"
 REMOTE_FRONTEND_INTERNAL_PORT="${REMOTE_FRONTEND_INTERNAL_PORT:-45173}"
 REMOTE_BACKEND_INTERNAL_PORT="${REMOTE_BACKEND_INTERNAL_PORT:-43000}"
 SSH_KEY_TEMP=""
@@ -49,7 +62,7 @@ require_non_empty() {
   local value="$1"
   local name="$2"
   if [[ -z "${value}" ]]; then
-    echo "[remote-setup] ERROR: ${name} is required (set it in env/.env.local or pass SSH target as arg)" >&2
+    echo "[remote-setup] ERROR: ${name} is required (set it in local env file or pass SSH target as arg)" >&2
     exit 1
   fi
 }
@@ -86,6 +99,7 @@ render_template() {
 require_non_empty "${SSH_TARGET}" "SSH_TARGET"
 require_non_empty "${SSH_KEY_PATH}" "SSH_KEY_PATH"
 require_non_empty "${PUBLIC_HOST}" "PUBLIC_HOST"
+require_non_empty "${TUNNEL_UPSTREAM_HOST}" "TUNNEL_UPSTREAM_HOST"
 require_file "${TUNNEL_CADDY_TEMPLATE}" "Tunnel Caddy template"
 
 [[ -f "${SSH_KEY_PATH}" ]] || {
@@ -112,6 +126,7 @@ render_template \
   "${TUNNEL_CADDY_TEMPLATE}" \
   "${CADDYFILE_TEMP}" \
   "PUBLIC_HOST" "${PUBLIC_HOST}" \
+  "TUNNEL_UPSTREAM_HOST" "${TUNNEL_UPSTREAM_HOST}" \
   "REMOTE_BACKEND_INTERNAL_PORT" "${REMOTE_BACKEND_INTERNAL_PORT}" \
   "REMOTE_FRONTEND_INTERNAL_PORT" "${REMOTE_FRONTEND_INTERNAL_PORT}"
 
@@ -127,7 +142,7 @@ ssh \
   -o ConnectTimeout=15 \
   -o StrictHostKeyChecking=accept-new \
   "${SSH_TARGET}" \
-  "PUBLIC_HOST='${PUBLIC_HOST}' REMOTE_CADDYFILE='${REMOTE_CADDYFILE}' bash -s" <<'REMOTE_SCRIPT'
+  "PUBLIC_HOST='${PUBLIC_HOST}' TUNNEL_UPSTREAM_HOST='${TUNNEL_UPSTREAM_HOST}' REMOTE_CADDYFILE='${REMOTE_CADDYFILE}' bash -s" <<'REMOTE_SCRIPT'
 set -Eeuo pipefail
 
 if ! command -v sudo >/dev/null 2>&1; then
@@ -166,5 +181,5 @@ sudo systemctl restart caddy
 sudo systemctl --no-pager --full status caddy | sed -n '1,40p'
 sudo ss -ltnp | sed -n '1,30p'
 
-echo "[remote-setup] Caddy configured for https://${PUBLIC_HOST}"
+echo "[remote-setup] Caddy configured for https://${PUBLIC_HOST} (tunnel upstream: ${TUNNEL_UPSTREAM_HOST})"
 REMOTE_SCRIPT

@@ -4,7 +4,18 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
-LOCAL_ENV_FILE="${LOCAL_ENV_FILE:-${ROOT_DIR}/.env.local}"
+DEFAULT_TUNNEL_ENV_FILE="${ROOT_DIR}/.env.tunnel"
+LEGACY_TUNNEL_ENV_FILE="${ROOT_DIR}/.env.tunnel.local"
+FALLBACK_ENV_FILE="${ROOT_DIR}/.env.local"
+if [[ -n "${LOCAL_ENV_FILE:-}" ]]; then
+  LOCAL_ENV_FILE="${LOCAL_ENV_FILE}"
+elif [[ -f "${DEFAULT_TUNNEL_ENV_FILE}" ]]; then
+  LOCAL_ENV_FILE="${DEFAULT_TUNNEL_ENV_FILE}"
+elif [[ -f "${LEGACY_TUNNEL_ENV_FILE}" ]]; then
+  LOCAL_ENV_FILE="${LEGACY_TUNNEL_ENV_FILE}"
+else
+  LOCAL_ENV_FILE="${FALLBACK_ENV_FILE}"
+fi
 
 load_local_env() {
   if [[ -f "${LOCAL_ENV_FILE}" ]]; then
@@ -31,10 +42,11 @@ Environment variables:
   LOCAL_BACKEND_PORT=3000
   REMOTE_FRONTEND_INTERNAL_PORT=45173
   REMOTE_BACKEND_INTERNAL_PORT=43000
+  REMOTE_TUNNEL_BIND_ADDRESS=127.0.0.1
   INSTALL_FRONTEND_DEPS=1
 
 Optional local env file:
-  .env.local (or LOCAL_ENV_FILE=<path>)
+  .env.tunnel (fallback: .env.tunnel.local, .env.local, or LOCAL_ENV_FILE=<path>)
 
 Requires (one-time):
   ./scripts/install-remote-caddy.sh [ssh_user@vps_host]
@@ -53,6 +65,7 @@ LOCAL_BACKEND_PORT="${LOCAL_BACKEND_PORT:-3000}"
 
 REMOTE_FRONTEND_INTERNAL_PORT="${REMOTE_FRONTEND_INTERNAL_PORT:-45173}"
 REMOTE_BACKEND_INTERNAL_PORT="${REMOTE_BACKEND_INTERNAL_PORT:-43000}"
+REMOTE_TUNNEL_BIND_ADDRESS="${REMOTE_TUNNEL_BIND_ADDRESS:-127.0.0.1}"
 
 INSTALL_FRONTEND_DEPS="${INSTALL_FRONTEND_DEPS:-1}"
 
@@ -78,8 +91,17 @@ require_non_empty() {
   local value="$1"
   local name="$2"
   if [[ -z "${value}" ]]; then
-    die "${name} is required (set it in env/.env.local or pass SSH target as arg)"
+    die "${name} is required (set it in local env file or pass SSH target as arg)"
   fi
+}
+
+extract_ssh_host() {
+  local target="$1"
+  local host_part="${target##*@}"
+  host_part="${host_part#[}"
+  host_part="${host_part%]}"
+  host_part="${host_part%%:*}"
+  printf '%s' "${host_part}"
 }
 
 prepare_ssh_key() {
@@ -192,6 +214,48 @@ wait_for_local_port() {
   die "Timed out waiting for ${name} on 127.0.0.1:${port}"
 }
 
+verify_remote_bind_address() {
+  if [[ "${REMOTE_TUNNEL_BIND_ADDRESS}" != "0.0.0.0" ]]; then
+    return 0
+  fi
+
+  local remote_listeners
+  remote_listeners="$(
+    ssh \
+      -i "${SSH_KEY_TEMP}" \
+      -o ConnectTimeout=15 \
+      -o StrictHostKeyChecking=accept-new \
+      "${SSH_TARGET}" \
+      "ss -ltn 2>/dev/null | grep -E ':(${REMOTE_FRONTEND_INTERNAL_PORT}|${REMOTE_BACKEND_INTERNAL_PORT})([[:space:]]|$)' || true" 2>/dev/null || true
+  )"
+
+  if [[ -z "${remote_listeners}" ]]; then
+    log "WARNING: Could not verify remote tunnel listeners on ${SSH_TARGET_HOST}."
+    return 0
+  fi
+
+  local has_public_frontend="0"
+  local has_public_backend="0"
+
+  if printf '%s\n' "${remote_listeners}" | grep -Eq "0\\.0\\.0\\.0:${REMOTE_FRONTEND_INTERNAL_PORT}|\\[::\\]:${REMOTE_FRONTEND_INTERNAL_PORT}"; then
+    has_public_frontend="1"
+  fi
+  if printf '%s\n' "${remote_listeners}" | grep -Eq "0\\.0\\.0\\.0:${REMOTE_BACKEND_INTERNAL_PORT}|\\[::\\]:${REMOTE_BACKEND_INTERNAL_PORT}"; then
+    has_public_backend="1"
+  fi
+
+  if [[ "${has_public_frontend}" == "1" && "${has_public_backend}" == "1" ]]; then
+    return 0
+  fi
+
+  log "WARNING: REMOTE_TUNNEL_BIND_ADDRESS=0.0.0.0 requested, but remote sshd did not open public listeners."
+  log "WARNING: Current listeners on ${SSH_TARGET_HOST}:"
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] && log "WARNING:   ${line}"
+  done <<<"${remote_listeners}"
+  log "WARNING: Set 'GatewayPorts clientspecified' in /etc/ssh/sshd_config on ${SSH_TARGET_HOST} and restart sshd."
+}
+
 require_cmd ssh
 require_cmd cargo
 require_cmd npm
@@ -199,6 +263,7 @@ require_cmd npm
 require_non_empty "${SSH_TARGET}" "SSH_TARGET"
 require_non_empty "${SSH_KEY_PATH}" "SSH_KEY_PATH"
 require_non_empty "${PUBLIC_HOST}" "PUBLIC_HOST"
+require_non_empty "${REMOTE_TUNNEL_BIND_ADDRESS}" "REMOTE_TUNNEL_BIND_ADDRESS"
 
 [[ -f "${SSH_KEY_PATH}" ]] || die "SSH key not found: ${SSH_KEY_PATH}"
 prepare_ssh_key
@@ -207,6 +272,13 @@ validate_port "${LOCAL_FRONTEND_PORT}" "LOCAL_FRONTEND_PORT"
 validate_port "${LOCAL_BACKEND_PORT}" "LOCAL_BACKEND_PORT"
 validate_port "${REMOTE_FRONTEND_INTERNAL_PORT}" "REMOTE_FRONTEND_INTERNAL_PORT"
 validate_port "${REMOTE_BACKEND_INTERNAL_PORT}" "REMOTE_BACKEND_INTERNAL_PORT"
+
+SSH_TARGET_HOST="$(extract_ssh_host "${SSH_TARGET}")"
+if [[ "${REMOTE_TUNNEL_BIND_ADDRESS}" =~ ^(127\.0\.0\.1|localhost|::1)$ ]] && [[ "${SSH_TARGET_HOST}" != "${PUBLIC_HOST}" ]]; then
+  log "WARNING: SSH_TARGET host (${SSH_TARGET_HOST}) differs from PUBLIC_HOST (${PUBLIC_HOST})."
+  log "WARNING: REMOTE_TUNNEL_BIND_ADDRESS=${REMOTE_TUNNEL_BIND_ADDRESS} only allows local access on ${SSH_TARGET_HOST}."
+  log "WARNING: For split servers, configure Caddy with TUNNEL_UPSTREAM_HOST and use REMOTE_TUNNEL_BIND_ADDRESS=0.0.0.0."
+fi
 
 log "Ensuring local ports are free..."
 kill_processes_on_port "${LOCAL_BACKEND_PORT}"
@@ -255,6 +327,7 @@ wait_for_local_port "${LOCAL_FRONTEND_PORT}" "frontend" "${FRONTEND_PID}"
 
 log "Opening SSH reverse tunnel via ${SSH_TARGET}..."
 log "Public app URL: https://${PUBLIC_HOST}"
+log "Remote tunnel bind address: ${REMOTE_TUNNEL_BIND_ADDRESS}"
 
 (
   ssh \
@@ -265,11 +338,14 @@ log "Public app URL: https://${PUBLIC_HOST}"
     -o ServerAliveCountMax=3 \
     -o StrictHostKeyChecking=accept-new \
     -N \
-    -R "127.0.0.1:${REMOTE_FRONTEND_INTERNAL_PORT}:127.0.0.1:${LOCAL_FRONTEND_PORT}" \
-    -R "127.0.0.1:${REMOTE_BACKEND_INTERNAL_PORT}:127.0.0.1:${LOCAL_BACKEND_PORT}" \
+    -R "${REMOTE_TUNNEL_BIND_ADDRESS}:${REMOTE_FRONTEND_INTERNAL_PORT}:127.0.0.1:${LOCAL_FRONTEND_PORT}" \
+    -R "${REMOTE_TUNNEL_BIND_ADDRESS}:${REMOTE_BACKEND_INTERNAL_PORT}:127.0.0.1:${LOCAL_BACKEND_PORT}" \
     "${SSH_TARGET}"
 ) &
 TUNNEL_PID="$!"
+
+sleep 0.5
+verify_remote_bind_address
 
 wait -n "${BACKEND_PID}" "${FRONTEND_PID}" "${TUNNEL_PID}" || true
 die "A process exited unexpectedly. Check logs above."

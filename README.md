@@ -117,20 +117,31 @@ Frontend env:
 
 This workflow uses a root-level reverse proxy on your VPS (for example Caddy) and a local reverse SSH tunnel.
 
-Put sensitive deployment values into `.env.local` (ignored by git):
+Put sensitive values into separate local env files (ignored by git):
 
 ```bash
-SSH_TARGET=<ssh_user@vps_host>
+# .env.tunnel
+SSH_TARGET=<ssh_user@tunnel_host>
 SSH_KEY_PATH=<path_to_private_key>
 PUBLIC_HOST=<public_https_host>
+TUNNEL_UPSTREAM_HOST=<tunnel_host_or_ip>
+REMOTE_TUNNEL_BIND_ADDRESS=127.0.0.1
 REMOTE_FRONTEND_INTERNAL_PORT=45173
 REMOTE_BACKEND_INTERNAL_PORT=43000
 GOOGLE_CLIENT_ID=<google_client_id>
 GOOGLE_CLIENT_SECRET=<google_client_secret>
 GOOGLE_REDIRECT_URI=https://<public_https_host>/api/google_oauth2
+
+# .env.install
+DEPLOY_SSH_TARGET=<ssh_user@production_host>
+DEPLOY_PUBLIC_HOST=<production_public_host>
+DEPLOY_SSH_KEY_PATH=<path_to_private_key>
+DEPLOY_GOOGLE_CLIENT_ID=<google_client_id>
+DEPLOY_GOOGLE_CLIENT_SECRET=<google_client_secret>
+DEPLOY_GOOGLE_REDIRECT_URI=https://<production_public_host>/api/google_oauth2
 ```
 
-Start from `.env.local.example` and fill your local values.
+Start from `.env.tunnel.example` and `.env.install.example`.
 
 One-time remote reverse-proxy setup:
 
@@ -139,6 +150,7 @@ One-time remote reverse-proxy setup:
 ```
 
 This script renders and installs `deploy/templates/caddy.tunnel.Caddyfile`.
+By default it reads `.env.tunnel`.
 
 Daily run (starts backend+frontend locally and opens tunnel):
 
@@ -151,9 +163,27 @@ Open:
 
 How it works:
 - Reverse proxy on VPS listens on `80`/`443` for `PUBLIC_HOST`.
-- Proxy forwards `/api/*` to `127.0.0.1:${REMOTE_BACKEND_INTERNAL_PORT}` on VPS.
-- Proxy forwards all other paths to `127.0.0.1:${REMOTE_FRONTEND_INTERNAL_PORT}` on VPS.
-- Local script keeps SSH reverse forwards from those VPS loopback ports to your local backend/frontend.
+- Proxy forwards `/api/*` to `${TUNNEL_UPSTREAM_HOST}:${REMOTE_BACKEND_INTERNAL_PORT}`.
+- Proxy forwards all other paths to `${TUNNEL_UPSTREAM_HOST}:${REMOTE_FRONTEND_INTERNAL_PORT}`.
+- Local script keeps SSH reverse forwards from `${REMOTE_TUNNEL_BIND_ADDRESS}:${REMOTE_*_INTERNAL_PORT}` on `SSH_TARGET` to your local backend/frontend.
+
+If `PUBLIC_HOST` and tunnel `SSH_TARGET` are different servers:
+- install Caddy on the `PUBLIC_HOST` server:
+
+```bash
+./scripts/install-remote-caddy.sh <ssh_user@public_host_server>
+```
+
+- run the tunnel to `SSH_TARGET` with non-loopback bind:
+
+```bash
+REMOTE_TUNNEL_BIND_ADDRESS=0.0.0.0 ./scripts/run-dev-tunnel.sh <ssh_user@ssh_target_host>
+```
+
+- ensure SSH server on tunnel `SSH_TARGET` allows non-loopback reverse binds:
+  set `GatewayPorts clientspecified` in `/etc/ssh/sshd_config` and restart sshd.
+
+Tunnel scripts support `LOCAL_ENV_FILE=<path>` and fallback to legacy `.env.tunnel.local` then `.env.local`.
 
 ## Production deploy (weak VPS friendly)
 
@@ -164,6 +194,8 @@ Use local build + artifact deploy:
 ```bash
 ./scripts/deploy-production.sh <ssh_user@prod_vps_host>
 ```
+
+By default, deploy script reads `.env.install` (fallback: `.env.install.local`, then `.env.local`).
 
 What it does:
 - builds backend release binary locally (`cargo build --release`)

@@ -4,7 +4,18 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
-LOCAL_ENV_FILE="${LOCAL_ENV_FILE:-${ROOT_DIR}/.env.local}"
+DEFAULT_INSTALL_ENV_FILE="${ROOT_DIR}/.env.install"
+LEGACY_INSTALL_ENV_FILE="${ROOT_DIR}/.env.install.local"
+FALLBACK_ENV_FILE="${ROOT_DIR}/.env.local"
+if [[ -n "${LOCAL_ENV_FILE:-}" ]]; then
+  LOCAL_ENV_FILE="${LOCAL_ENV_FILE}"
+elif [[ -f "${DEFAULT_INSTALL_ENV_FILE}" ]]; then
+  LOCAL_ENV_FILE="${DEFAULT_INSTALL_ENV_FILE}"
+elif [[ -f "${LEGACY_INSTALL_ENV_FILE}" ]]; then
+  LOCAL_ENV_FILE="${LEGACY_INSTALL_ENV_FILE}"
+else
+  LOCAL_ENV_FILE="${FALLBACK_ENV_FILE}"
+fi
 TEMPLATE_DIR="${ROOT_DIR}/deploy/templates"
 PRODUCTION_CADDY_TEMPLATE="${TEMPLATE_DIR}/caddy.production.Caddyfile"
 BACKEND_SERVICE_TEMPLATE="${TEMPLATE_DIR}/qstream-backend.service"
@@ -76,7 +87,7 @@ require_non_empty() {
   local value="$1"
   local name="$2"
   if [[ -z "${value}" ]]; then
-    die "${name} is required (set env/.env.local or pass ssh target argument)"
+    die "${name} is required (set it in local env file or pass ssh target argument)"
   fi
 }
 

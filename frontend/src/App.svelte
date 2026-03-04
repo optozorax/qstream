@@ -4,20 +4,36 @@
 
   const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '0.0.0.0'])
 
+  function defaultApiBase() {
+    if (LOCAL_HOSTNAMES.has(window.location.hostname)) {
+      return `${window.location.protocol}//${window.location.hostname}:3000`
+    }
+    return window.location.origin
+  }
+
   function resolveApiBase(rawApiBase) {
-    const fallback = `${window.location.protocol}//${window.location.hostname}:3000`
+    const fallback = defaultApiBase()
     if (!rawApiBase) {
       return fallback
     }
 
     try {
-      const url = new URL(rawApiBase)
-      if (
-        LOCAL_HOSTNAMES.has(url.hostname) &&
-        !LOCAL_HOSTNAMES.has(window.location.hostname)
-      ) {
-        url.hostname = window.location.hostname
+      const url = new URL(rawApiBase, window.location.origin)
+      const pageIsLocal = LOCAL_HOSTNAMES.has(window.location.hostname)
+      const apiIsLocal = LOCAL_HOSTNAMES.has(url.hostname)
+      const sameHost = url.hostname === window.location.hostname
+
+      if (!pageIsLocal) {
+        if (apiIsLocal || (sameHost && url.port === '3000')) {
+          // Production should use same-origin HTTPS behind Caddy, not raw :3000.
+          url.protocol = window.location.protocol
+          url.hostname = window.location.hostname
+          url.port = ''
+        } else if (sameHost && window.location.protocol === 'https:' && url.protocol === 'http:') {
+          url.protocol = 'https:'
+        }
       }
+
       return url.toString().replace(/\/$/, '')
     } catch {
       return rawApiBase.replace(/\/$/, '')

@@ -138,6 +138,8 @@ One-time remote reverse-proxy setup:
 ./scripts/install-remote-caddy.sh
 ```
 
+This script renders and installs `deploy/templates/caddy.tunnel.Caddyfile`.
+
 Daily run (starts backend+frontend locally and opens tunnel):
 
 ```bash
@@ -152,6 +154,44 @@ How it works:
 - Proxy forwards `/api/*` to `127.0.0.1:${REMOTE_BACKEND_INTERNAL_PORT}` on VPS.
 - Proxy forwards all other paths to `127.0.0.1:${REMOTE_FRONTEND_INTERNAL_PORT}` on VPS.
 - Local script keeps SSH reverse forwards from those VPS loopback ports to your local backend/frontend.
+
+## Production deploy (weak VPS friendly)
+
+For low-resource VPS (for example `1 CPU / 512MB / 10GB`), avoid building Rust or installing `node_modules` on the server.
+
+Use local build + artifact deploy:
+
+```bash
+./scripts/deploy-production.sh <ssh_user@prod_vps_host>
+```
+
+What it does:
+- builds backend release binary locally (`cargo build --release`)
+- builds frontend static files locally (`npm run build`)
+- uploads only binary + static assets + env to server
+- installs/updates:
+  - `qstream-backend.service` (systemd)
+  - Caddy config for `https://<DEPLOY_PUBLIC_HOST>`
+  - persistent journald logs (`/var/log/journal`)
+
+Config templates used by deploy:
+- `deploy/templates/qstream-backend.service`
+- `deploy/templates/caddy.production.Caddyfile`
+- `deploy/templates/qstream-journald.conf`
+
+Frontend runtime choice:
+- Best for this setup: **no runtime on server** (no Node/Bun/Deno).
+- Build frontend on your local machine and serve static `dist` via Caddy.
+
+Useful log commands:
+
+```bash
+ssh <ssh_user@prod_vps_host> 'sudo journalctl -u qstream-backend -f'
+ssh <ssh_user@prod_vps_host> 'sudo journalctl -u caddy -f'
+```
+
+Server layout, operations, and debugging checklist:
+- `docs/remote-server-operations.md`
 
 ## Frontend behavior
 

@@ -29,6 +29,8 @@ You can start from `.env.local.example`.
 ./scripts/install-remote-caddy.sh
 ```
 
+This renders and installs `deploy/templates/caddy.tunnel.Caddyfile`.
+
 ### Daily tunnel run
 
 ```bash
@@ -63,3 +65,24 @@ curl -sv "https://${PUBLIC_HOST}/api/health"
 Expected:
 - `/` returns `HTTP 200` and frontend HTML
 - `/api/health` returns `HTTP 200` with `{"ok":true}`
+
+## Production Deploy
+
+For weak VPS, deploy prebuilt artifacts (no Rust build / no node_modules on server):
+
+```bash
+./scripts/deploy-production.sh <ssh_user@prod_vps_host>
+```
+
+This script configures:
+- `qstream-backend.service` (systemd)
+- Caddy site config (static frontend + `/api` reverse proxy)
+- persistent journald logs
+
+Templates:
+- `deploy/templates/qstream-backend.service`
+- `deploy/templates/caddy.production.Caddyfile`
+- `deploy/templates/qstream-journald.conf`
+
+Ops/debug guide:
+- `docs/remote-server-operations.md`

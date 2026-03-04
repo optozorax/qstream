@@ -1,0 +1,13 @@
+__DEPLOY_PUBLIC_HOST__ {
+    encode zstd gzip
+
+    handle /api/* {
+        reverse_proxy 127.0.0.1:__DEPLOY_BACKEND_PORT__
+    }
+
+    handle {
+        root * __DEPLOY_REMOTE_DIR__/current/frontend
+        try_files {path} /index.html
+        file_server
+    }
+}

@@ -1,0 +1,23 @@
+[Unit]
+Description=QStream Backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__DEPLOY_SYSTEM_USER__
+Group=__DEPLOY_SYSTEM_USER__
+WorkingDirectory=/var/lib/qstream
+EnvironmentFile=/etc/qstream/backend.env
+ExecStart=__DEPLOY_REMOTE_DIR__/current/bin/qstream-backend
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/qstream
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

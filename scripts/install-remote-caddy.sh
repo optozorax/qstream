@@ -5,6 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
 LOCAL_ENV_FILE="${LOCAL_ENV_FILE:-${ROOT_DIR}/.env.local}"
+TEMPLATE_DIR="${ROOT_DIR}/deploy/templates"
+TUNNEL_CADDY_TEMPLATE="${TEMPLATE_DIR}/caddy.tunnel.Caddyfile"
 
 load_local_env() {
   if [[ -f "${LOCAL_ENV_FILE}" ]]; then
@@ -41,6 +43,7 @@ PUBLIC_HOST="${PUBLIC_HOST:-}"
 REMOTE_FRONTEND_INTERNAL_PORT="${REMOTE_FRONTEND_INTERNAL_PORT:-45173}"
 REMOTE_BACKEND_INTERNAL_PORT="${REMOTE_BACKEND_INTERNAL_PORT:-43000}"
 SSH_KEY_TEMP=""
+CADDYFILE_TEMP=""
 
 require_non_empty() {
   local value="$1"
@@ -51,9 +54,39 @@ require_non_empty() {
   fi
 }
 
+require_file() {
+  local path="$1"
+  local name="$2"
+  if [[ ! -f "${path}" ]]; then
+    echo "[remote-setup] ERROR: ${name} not found: ${path}" >&2
+    exit 1
+  fi
+}
+
+escape_sed_replacement() {
+  printf '%s' "$1" | sed -e 's/[\\/&]/\\&/g'
+}
+
+render_template() {
+  local template_path="$1"
+  local output_path="$2"
+  shift 2
+
+  cp "${template_path}" "${output_path}"
+  while (($#)); do
+    local key="$1"
+    local value="$2"
+    local escaped_value
+    shift 2
+    escaped_value="$(escape_sed_replacement "${value}")"
+    sed -i "s|__${key}__|${escaped_value}|g" "${output_path}"
+  done
+}
+
 require_non_empty "${SSH_TARGET}" "SSH_TARGET"
 require_non_empty "${SSH_KEY_PATH}" "SSH_KEY_PATH"
 require_non_empty "${PUBLIC_HOST}" "PUBLIC_HOST"
+require_file "${TUNNEL_CADDY_TEMPLATE}" "Tunnel Caddy template"
 
 [[ -f "${SSH_KEY_PATH}" ]] || {
   echo "[remote-setup] ERROR: SSH key not found at ${SSH_KEY_PATH}" >&2
@@ -64,6 +97,9 @@ cleanup() {
   if [[ -n "${SSH_KEY_TEMP}" && -f "${SSH_KEY_TEMP}" ]]; then
     rm -f "${SSH_KEY_TEMP}"
   fi
+  if [[ -n "${CADDYFILE_TEMP}" && -f "${CADDYFILE_TEMP}" ]]; then
+    rm -f "${CADDYFILE_TEMP}"
+  fi
 }
 trap cleanup EXIT INT TERM
 
@@ -71,12 +107,27 @@ SSH_KEY_TEMP="$(mktemp)"
 cp "${SSH_KEY_PATH}" "${SSH_KEY_TEMP}"
 chmod 600 "${SSH_KEY_TEMP}"
 
+CADDYFILE_TEMP="$(mktemp)"
+render_template \
+  "${TUNNEL_CADDY_TEMPLATE}" \
+  "${CADDYFILE_TEMP}" \
+  "PUBLIC_HOST" "${PUBLIC_HOST}" \
+  "REMOTE_BACKEND_INTERNAL_PORT" "${REMOTE_BACKEND_INTERNAL_PORT}" \
+  "REMOTE_FRONTEND_INTERNAL_PORT" "${REMOTE_FRONTEND_INTERNAL_PORT}"
+
+REMOTE_CADDYFILE="/tmp/qstream-install-caddy-$(date -u +%Y%m%d%H%M%S).Caddyfile"
+scp \
+  -i "${SSH_KEY_TEMP}" \
+  -o ConnectTimeout=15 \
+  -o StrictHostKeyChecking=accept-new \
+  "${CADDYFILE_TEMP}" "${SSH_TARGET}:${REMOTE_CADDYFILE}"
+
 ssh \
   -i "${SSH_KEY_TEMP}" \
   -o ConnectTimeout=15 \
   -o StrictHostKeyChecking=accept-new \
   "${SSH_TARGET}" \
-  "PUBLIC_HOST='${PUBLIC_HOST}' REMOTE_FRONTEND_INTERNAL_PORT='${REMOTE_FRONTEND_INTERNAL_PORT}' REMOTE_BACKEND_INTERNAL_PORT='${REMOTE_BACKEND_INTERNAL_PORT}' bash -s" <<'REMOTE_SCRIPT'
+  "PUBLIC_HOST='${PUBLIC_HOST}' REMOTE_CADDYFILE='${REMOTE_CADDYFILE}' bash -s" <<'REMOTE_SCRIPT'
 set -Eeuo pipefail
 
 if ! command -v sudo >/dev/null 2>&1; then
@@ -85,31 +136,35 @@ if ! command -v sudo >/dev/null 2>&1; then
 fi
 
 if ! command -v caddy >/dev/null 2>&1; then
+  echo "[remote-setup] Caddy is not installed. Installing..."
   sudo apt-get update
   sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg
   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
   sudo apt-get update
   sudo apt-get install -y caddy
+else
+  echo "[remote-setup] Caddy already installed. Skipping installation."
 fi
 
-sudo tee /etc/caddy/Caddyfile >/dev/null <<CADDY
-${PUBLIC_HOST} {
-    encode zstd gzip
+# Caddy must own :80/:443 for automatic HTTPS.
+if command -v nginx >/dev/null 2>&1; then
+  if systemctl is-enabled --quiet nginx 2>/dev/null || systemctl is-active --quiet nginx 2>/dev/null; then
+    echo "[remote-setup] Disabling nginx so Caddy can bind ports 80/443..."
+    sudo systemctl stop nginx || true
+    sudo systemctl disable nginx || true
+  fi
+fi
 
-    # API from local machine via SSH reverse tunnel
-    reverse_proxy /api/* 127.0.0.1:${REMOTE_BACKEND_INTERNAL_PORT}
-
-    # Frontend from local machine via SSH reverse tunnel
-    reverse_proxy 127.0.0.1:${REMOTE_FRONTEND_INTERNAL_PORT}
-}
-CADDY
+sudo mv "${REMOTE_CADDYFILE}" /etc/caddy/Caddyfile
+sudo chmod 0644 /etc/caddy/Caddyfile
 
 sudo caddy fmt --overwrite /etc/caddy/Caddyfile
 sudo caddy validate --config /etc/caddy/Caddyfile
 sudo systemctl enable caddy
 sudo systemctl restart caddy
 sudo systemctl --no-pager --full status caddy | sed -n '1,40p'
+sudo ss -ltnp | sed -n '1,30p'
 
 echo "[remote-setup] Caddy configured for https://${PUBLIC_HOST}"
 REMOTE_SCRIPT

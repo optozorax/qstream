@@ -253,6 +253,7 @@ struct QuestionView {
     created_at: i64,
     score: i64,
     votes_count: i64,
+    user_vote: i64,
 }
 
 #[derive(FromRow)]
@@ -974,16 +975,18 @@ async fn create_session(
 
 async fn list_questions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(code): Path<String>,
     Query(query): Query<ListQuestionsQuery>,
 ) -> Result<Json<ListQuestionsResponse>, AppError> {
     let session = find_session_by_code(&state.db, &code).await?;
+    let viewer_user_id = optional_auth_user_id(&state, &headers).await;
 
     let raw_sort = query.sort.as_deref().unwrap_or("top");
     let sort = QuestionSort::parse(raw_sort)
         .ok_or_else(|| AppError::bad_request("sort must be 'top', 'new', or 'answered'"))?;
 
-    let questions = list_questions_for_session(&state.db, session.id, sort).await?;
+    let questions = list_questions_for_session(&state.db, session.id, sort, viewer_user_id).await?;
 
     Ok(Json(ListQuestionsResponse {
         session,
@@ -1227,8 +1230,8 @@ async fn vote_question(
 ) -> Result<Json<VoteResponse>, AppError> {
     let auth = require_auth_user(&state, &headers).await?;
 
-    if payload.value != -1 && payload.value != 1 {
-        return Err(AppError::bad_request("vote value must be -1 or 1"));
+    if payload.value != -1 && payload.value != 0 && payload.value != 1 {
+        return Err(AppError::bad_request("vote value must be -1, 0, or 1"));
     }
 
     let question_meta = sqlx::query_as::<_, QuestionVoteMeta>(
@@ -1296,21 +1299,32 @@ async fn vote_question(
         ));
     }
 
-    sqlx::query(
-        r#"
-        INSERT INTO votes (question_id, user_id, value, created_at, updated_at)
-        VALUES (?1, ?2, ?3, unixepoch(), unixepoch())
-        ON CONFLICT(question_id, user_id) DO UPDATE
-        SET value = excluded.value,
-            updated_at = unixepoch();
-        "#,
-    )
-    .bind(question_id)
-    .bind(auth.user_id)
-    .bind(payload.value)
-    .execute(&state.db)
-    .await
-    .map_err(|err| AppError::internal(format!("failed to save vote: {err}")))?;
+    if payload.value == 0 {
+        sqlx::query(
+            "DELETE FROM votes WHERE question_id = ?1 AND user_id = ?2;",
+        )
+        .bind(question_id)
+        .bind(auth.user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to remove vote: {err}")))?;
+    } else {
+        sqlx::query(
+            r#"
+            INSERT INTO votes (question_id, user_id, value, created_at, updated_at)
+            VALUES (?1, ?2, ?3, unixepoch(), unixepoch())
+            ON CONFLICT(question_id, user_id) DO UPDATE
+            SET value = excluded.value,
+                updated_at = unixepoch();
+            "#,
+        )
+        .bind(question_id)
+        .bind(auth.user_id)
+        .bind(payload.value)
+        .execute(&state.db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to save vote: {err}")))?;
+    }
 
     let score: i64 = sqlx::query_scalar(
         r#"
@@ -1673,6 +1687,26 @@ async fn update_session(
     Ok(Json(updated))
 }
 
+async fn optional_auth_user_id(state: &AppState, headers: &HeaderMap) -> Option<i64> {
+    let token = extract_bearer_token(headers)?;
+    let token_hash = hash_token(&token);
+
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT s.user_id
+        FROM auth_sessions s
+        WHERE s.token_hash = ?1
+          AND (s.expires_at IS NULL OR s.expires_at > unixepoch())
+        ORDER BY s.id DESC
+        LIMIT 1;
+        "#,
+    )
+    .bind(&token_hash)
+    .fetch_optional(&state.db)
+    .await
+    .ok()?
+}
+
 async fn require_auth_user(state: &AppState, headers: &HeaderMap) -> Result<AuthUser, AppError> {
     let token = extract_bearer_token(headers)
         .ok_or_else(|| AppError::unauthorized("missing bearer token"))?;
@@ -1737,6 +1771,7 @@ async fn list_questions_for_session(
     db: &SqlitePool,
     session_id: i64,
     sort: QuestionSort,
+    viewer_user_id: Option<i64>,
 ) -> Result<Vec<QuestionView>, AppError> {
     let (filter, order_by) = match sort {
         QuestionSort::Answered => (
@@ -1767,10 +1802,12 @@ async fn list_questions_for_session(
             q.is_deleted,
             CAST(q.created_at AS INTEGER) AS created_at,
             COALESCE(SUM(v.value), 0) AS score,
-            COALESCE(COUNT(v.user_id), 0) AS votes_count
+            COALESCE(COUNT(v.user_id), 0) AS votes_count,
+            COALESCE(MAX(uv.value), 0) AS user_vote
         FROM questions q
         JOIN users u ON u.id = q.author_user_id
         LEFT JOIN votes v ON v.question_id = q.id
+        LEFT JOIN votes uv ON uv.question_id = q.id AND uv.user_id = ?2
         {filter}
         GROUP BY q.id, q.session_id, q.author_user_id, u.nickname, q.body, q.is_answering, q.is_answered, q.is_rejected, q.is_deleted, q.created_at
         {order_by};
@@ -1779,6 +1816,7 @@ async fn list_questions_for_session(
 
     sqlx::query_as::<_, QuestionView>(&sql)
         .bind(session_id)
+        .bind(viewer_user_id.unwrap_or(-1))
         .fetch_all(db)
         .await
         .map_err(|err| AppError::internal(format!("failed to list questions: {err}")))
@@ -1799,7 +1837,8 @@ async fn fetch_question_by_id(db: &SqlitePool, question_id: i64) -> Result<Quest
             q.is_deleted,
             CAST(q.created_at AS INTEGER) AS created_at,
             COALESCE(SUM(v.value), 0) AS score,
-            COALESCE(COUNT(v.user_id), 0) AS votes_count
+            COALESCE(COUNT(v.user_id), 0) AS votes_count,
+            0 AS user_vote
         FROM questions q
         JOIN users u ON u.id = q.author_user_id
         LEFT JOIN votes v ON v.question_id = q.id

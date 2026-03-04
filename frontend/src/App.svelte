@@ -593,10 +593,16 @@
     loadingQuestions = true
     try {
       const payload = await apiRequest(
-        `/api/sessions/${encodeURIComponent(code)}/questions?sort=${encodeURIComponent(sessionSort)}`
+        `/api/sessions/${encodeURIComponent(code)}/questions?sort=${encodeURIComponent(sessionSort)}`,
+        { auth: true }
       )
       sessionData = payload.session
       questions = payload.questions
+      const serverVotes = {}
+      for (const q of payload.questions) {
+        if (q.user_vote !== 0) serverVotes[q.id] = q.user_vote
+      }
+      localVotes = serverVotes
       rememberCurrentUserAuthoredQuestions(code)
       sessionError = ''
       pendingNewQuestions = 0
@@ -1215,29 +1221,25 @@
         {#each visibleQuestions as item}
           <article class="q-card" class:answering={item.is_answering === 1} class:answered={item.is_answered === 1} class:rejected={item.is_rejected === 1}>
             <div class="q-vote-col">
-              {#if viewerCanInteract}
-                <button
-                  type="button"
-                  class="q-vote-btn"
-                  class:upvoted={localVotes[item.id] === 1}
-                  on:click={() => vote(item.id, 1)}
-                  disabled={voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1 || item.is_rejected === 1}
-                  title="Upvote"
-                >&#9650;</button>
-              {/if}
+              <button
+                type="button"
+                class="q-vote-btn"
+                class:upvoted={localVotes[item.id] === 1}
+                on:click={() => vote(item.id, localVotes[item.id] === 1 ? 0 : 1)}
+                disabled={!viewerCanInteract || voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1 || item.is_rejected === 1}
+                title="Upvote"
+              >&#9650;</button>
 
               <span class="q-score">{item.score}</span>
 
-              {#if viewerCanInteract}
-                <button
-                  type="button"
-                  class="q-vote-btn"
-                  class:downvoted={localVotes[item.id] === -1}
-                  on:click={() => vote(item.id, -1)}
-                  disabled={voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1 || item.is_rejected === 1}
-                  title="Downvote"
-                >&#9660;</button>
-              {/if}
+              <button
+                type="button"
+                class="q-vote-btn"
+                class:downvoted={localVotes[item.id] === -1}
+                on:click={() => vote(item.id, localVotes[item.id] === -1 ? 0 : -1)}
+                disabled={!viewerCanInteract || voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1 || item.is_rejected === 1}
+                title="Downvote"
+              >&#9660;</button>
             </div>
 
             <div class="q-body-col">

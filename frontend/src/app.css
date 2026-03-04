@@ -389,8 +389,8 @@ textarea:focus {
 }
 
 .q-vote-btn.upvoted {
-  color: var(--accent);
-  background: var(--accent-soft);
+  color: var(--green);
+  background: var(--green-soft);
 }
 
 .q-vote-btn.downvoted {

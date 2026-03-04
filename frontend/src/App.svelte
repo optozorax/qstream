@@ -2,6 +2,9 @@
   import { onDestroy, onMount } from 'svelte'
   import LoginPanel from './lib/LoginPanel.svelte'
   import ConfirmButton from './lib/ConfirmButton.svelte'
+  import SessionDetailsFields from './lib/SessionDetailsFields.svelte'
+  import Spinner from './lib/Spinner.svelte'
+  import Notifications from './lib/Notifications.svelte'
 
   const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '0.0.0.0'])
 
@@ -99,11 +102,20 @@
   let sessionData = null
   let questions = []
   let loadingQuestions = false
-  let sessionError = ''
   let viewerIsBanned = false
 
+  let notifHistory = []
+  let activeToasts = []
+  let notifCounter = 0
+  function addNotification(msg, type = 'info') {
+    const id = ++notifCounter
+    const entry = { id, msg, type, time: Date.now() }
+    notifHistory = [entry, ...notifHistory]
+    activeToasts = [...activeToasts, entry]
+    setTimeout(() => { activeToasts = activeToasts.filter(n => n.id !== id) }, 3000)
+  }
+
   let questionText = ''
-  let questionStatus = ''
   let questionBusy = false
   let newQuestionId = null
   let newQuestionTimer = null
@@ -140,6 +152,8 @@
   let updateModeTouched = false
   let pendingNewQuestions = 0
   let sseConnected = false
+  let refreshQuestionsRequestId = 0
+  let refreshQuestionsAbortController = null
 
   const AUTO_REFRESH_DEBOUNCE_MS = 300
 
@@ -165,6 +179,7 @@
   onDestroy(() => {
     disconnectSessionEvents()
     clearAutoRefreshDebounce()
+    cancelRefreshQuestions()
     if (questionCooldownTimer !== null) clearInterval(questionCooldownTimer)
     if (newQuestionTimer !== null) clearTimeout(newQuestionTimer)
   })
@@ -177,11 +192,10 @@
     activeSessionCode = null
     disconnectSessionEvents()
     clearAutoRefreshDebounce()
+    cancelRefreshQuestions()
     sessionData = null
     questions = []
-    sessionError = ''
     questionText = ''
-    questionStatus = ''
     updateMode = 'manual'
     updateModeTouched = false
     pendingNewQuestions = 0
@@ -446,7 +460,6 @@
           localStorage.setItem(USER_KEY, JSON.stringify(currentUser))
           if (route.name === 'session') {
             showSessionLogin = false
-            questionStatus = 'Logged in. You can ask and vote now.'
             localVotes = {}
             loadInteractedQuestions(route.code)
           } else {
@@ -455,9 +468,8 @@
         }
       } catch {
         logout()
-        if (route.name === 'session') {
-          questionStatus = 'Google login failed. Please retry.'
-        } else {
+        addNotification('Google login failed. Please retry.', 'error')
+        if (route.name !== 'session') {
           homeMessage = 'Google login failed. Please retry.'
         }
       } finally {
@@ -493,10 +505,9 @@
         return
       }
 
+      addNotification('Saved login expired. Please log in again.', 'error')
       if (route.name === 'home') {
         homeMessage = 'Saved login expired. Please log in again.'
-      } else {
-        questionStatus = 'Saved login expired. Please log in again.'
       }
     }
   }
@@ -543,6 +554,7 @@
   async function startSessionView(code) {
     disconnectSessionEvents()
     clearAutoRefreshDebounce()
+    cancelRefreshQuestions()
     activeSessionCode = code
     updateMode = 'manual'
     updateModeTouched = false
@@ -562,6 +574,19 @@
       window.clearTimeout(autoRefreshDebounceTimer)
       autoRefreshDebounceTimer = null
     }
+  }
+
+  function cancelRefreshQuestions() {
+    refreshQuestionsRequestId += 1
+    if (refreshQuestionsAbortController !== null) {
+      refreshQuestionsAbortController.abort()
+      refreshQuestionsAbortController = null
+    }
+    loadingQuestions = false
+  }
+
+  function isAbortError(error) {
+    return !!error && typeof error === 'object' && error.name === 'AbortError'
   }
 
   function scheduleAutoRefresh() {
@@ -647,12 +672,25 @@
       return
     }
 
+    const requestId = ++refreshQuestionsRequestId
+    if (refreshQuestionsAbortController !== null) {
+      refreshQuestionsAbortController.abort()
+    }
+    const controller = new AbortController()
+    refreshQuestionsAbortController = controller
+    const requestedSort = sessionSort
+
     loadingQuestions = true
     try {
       const payload = await apiRequest(
-        `/api/sessions/${encodeURIComponent(code)}/questions?sort=${encodeURIComponent(sessionSort)}`,
-        { auth: true }
+        `/api/sessions/${encodeURIComponent(code)}/questions?sort=${encodeURIComponent(requestedSort)}`,
+        { auth: true, signal: controller.signal }
       )
+
+      if (requestId !== refreshQuestionsRequestId || route.name !== 'session' || activeSessionCode !== code) {
+        return
+      }
+
       sessionData = payload.session
       questions = payload.questions
       const serverVotes = {}
@@ -665,12 +703,17 @@
         startQuestionCooldown(payload.question_cooldown_remaining)
       }
       rememberCurrentUserAuthoredQuestions(code)
-      sessionError = ''
       pendingNewQuestions = 0
     } catch (error) {
-      sessionError = error instanceof Error ? error.message : 'Failed to load questions.'
+      if (isAbortError(error) || requestId !== refreshQuestionsRequestId) {
+        return
+      }
+      addNotification(error instanceof Error ? error.message : 'Failed to load questions.', 'error')
     } finally {
-      loadingQuestions = false
+      if (requestId === refreshQuestionsRequestId) {
+        loadingQuestions = false
+        refreshQuestionsAbortController = null
+      }
     }
   }
 
@@ -702,23 +745,22 @@
     event.preventDefault()
 
     if (!authToken) {
-      questionStatus = 'Login first to submit a question.'
+      addNotification('Login first to submit a question.', 'error')
       return
     }
 
     const text = questionText.trim()
     if (!text) {
-      questionStatus = 'Question cannot be empty.'
+      addNotification('Question cannot be empty.', 'error')
       return
     }
 
     if (text.length > 300) {
-      questionStatus = 'Question max length is 300 characters.'
+      addNotification('Question max length is 300 characters.', 'error')
       return
     }
 
     questionBusy = true
-    questionStatus = ''
 
     try {
       const payload = await apiRequest(`/api/sessions/${encodeURIComponent(route.code)}/questions`, {
@@ -735,7 +777,7 @@
       await refreshQuestions()
       newQuestionTimer = setTimeout(() => { newQuestionId = null; newQuestionTimer = null }, 3000)
     } catch (error) {
-      questionStatus = error instanceof Error ? error.message : 'Failed to add question.'
+      addNotification(error instanceof Error ? error.message : 'Failed to add question.', 'error')
     } finally {
       questionBusy = false
     }
@@ -772,7 +814,7 @@
         questions = [...questions]
       }
     } catch (error) {
-      questionStatus = error instanceof Error ? error.message : 'Failed to vote.'
+      addNotification(error instanceof Error ? error.message : 'Failed to vote.', 'error')
     } finally {
       voteBusy.delete(questionId)
       voteBusy = new Set(voteBusy)
@@ -790,12 +832,12 @@
 
   async function moderateQuestion(questionId, action) {
     if (!authToken) {
-      questionStatus = 'Login first.'
+      addNotification('Login first.', 'error')
       return
     }
 
     if (!admin) {
-      questionStatus = 'Only session owner can moderate questions.'
+      addNotification('Only session owner can moderate questions.', 'error')
       return
     }
 
@@ -810,27 +852,27 @@
       })
 
       if (payload.deleted) {
-        questionStatus = 'Question deleted.'
+        addNotification('Question deleted.')
         await refreshQuestions()
       } else if (payload.banned) {
-        questionStatus = 'User banned. Questions deleted.'
+        addNotification('User banned. Questions deleted.')
         await refreshQuestions()
       } else if (payload.question) {
         if (action === 'answer') {
-          questionStatus = 'Question is now in progress.'
+          addNotification('Question is now in progress.')
         } else if (action === 'finish_answering') {
-          questionStatus = 'Question moved to answered.'
+          addNotification('Question moved to answered.')
         } else if (action === 'reject') {
-          questionStatus = 'Question rejected.'
+          addNotification('Question rejected.')
         } else if (action === 'reopen') {
-          questionStatus = 'Question reopened.'
+          addNotification('Question reopened.')
         } else {
-          questionStatus = 'Question updated.'
+          addNotification('Question updated.')
         }
         await refreshQuestions()
       }
     } catch (error) {
-      questionStatus = error instanceof Error ? error.message : 'Moderation failed.'
+      addNotification(error instanceof Error ? error.message : 'Moderation failed.', 'error')
     } finally {
       moderateBusy.delete(questionId)
       moderateBusy = new Set(moderateBusy)
@@ -1039,12 +1081,18 @@
   }
 </script>
 
+<svelte:head>
+  <title>{sessionData?.name ? `${sessionData.name} | qstream` : 'qstream'}</title>
+</svelte:head>
+
 <div class="app-shell">
   {#if route.name === 'home'}
     <!-- HOME PAGE -->
     <div class="app-body" style="display: grid; place-items: center; min-height: 100vh;">
       <div class="card card-centered">
-        <span class="label-tag">QStream</span>
+        <span class="label-tag" style="display: flex; align-items: center; gap: 6px; justify-content: center;">
+          <img src="/icon-64.webp" alt="" style="width: 20px; height: 20px;" />QStream
+        </span>
         <h1>Question Room</h1>
         <p class="subtitle">
           Collect and rank audience questions in real time during your stream.
@@ -1061,11 +1109,11 @@
 
           <!-- Session list -->
           {#if loadingSessions}
-            <p class="text-sm text-secondary" style="margin-bottom: 12px;">Loading sessions...</p>
+            <p class="text-sm text-secondary" style="margin-bottom: 12px; display: flex; align-items: center; gap: 6px;"><Spinner size={13} />Loading sessions...</p>
           {:else if userSessions.length > 0}
             <div style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px;">
               {#each userSessions as session}
-                <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; background: var(--color-surface-2, #f5f5f5); border-radius: 8px;">
+                <div class="surface-row">
                   <div style="min-width: 0; flex: 1;">
                     <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
                       <span style="font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{session.name}</span>
@@ -1098,41 +1146,14 @@
 
           <!-- Create session -->
           {#if showCreateForm}
-            <form on:submit={createSession} style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 8px;">
-              <div>
-                <label for="create-name" class="text-sm" style="display: block; margin-bottom: 4px;">Name <span style="color: var(--color-danger)">*</span></label>
-                <input
-                  id="create-name"
-                  type="text"
-                  maxlength="100"
-                  bind:value={createName}
-                  placeholder="My Stream Q&A"
-                  style="width: 100%; box-sizing: border-box;"
-                />
-              </div>
-              <div>
-                <label for="create-description" class="text-sm" style="display: block; margin-bottom: 4px;">Description</label>
-                <textarea
-                  id="create-description"
-                  maxlength="500"
-                  bind:value={createDescription}
-                  placeholder="Short description shown to viewers"
-                  rows="2"
-                  style="width: 100%; box-sizing: border-box;"
-                ></textarea>
-              </div>
-              <div>
-                <label for="create-stream-link" class="text-sm" style="display: block; margin-bottom: 4px;">Stream link</label>
-                <input
-                  id="create-stream-link"
-                  type="url"
-                  maxlength="500"
-                  bind:value={createStreamLink}
-                  placeholder="https://twitch.tv/yourname"
-                  style="width: 100%; box-sizing: border-box;"
-                />
-              </div>
-              <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+            <form on:submit={createSession} class="form-compact">
+              <SessionDetailsFields
+                prefix="create"
+                bind:name={createName}
+                bind:description={createDescription}
+                bind:streamLink={createStreamLink}
+              />
+              <div class="form-actions form-actions-wrap">
                 <button type="submit" class="btn btn-primary" disabled={createBusy}>
                   {createBusy ? 'Creating...' : 'Create'}
                 </button>
@@ -1140,7 +1161,7 @@
                   Cancel
                 </button>
                 {#if createStatus}
-                  <span class="text-sm" style="color: var(--color-danger);">{createStatus}</span>
+                  <span class="text-sm text-danger">{createStatus}</span>
                 {/if}
               </div>
             </form>
@@ -1151,7 +1172,7 @@
           {/if}
 
           <!-- Banned users section -->
-          <div style="border-top: 1px solid var(--color-border, #e0e0e0); margin-top: 16px; padding-top: 16px;">
+          <div class="section-divider">
             <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
               <p class="text-sm" style="font-weight: 600; margin: 0;">Banned users</p>
               <button type="button" class="btn btn-ghost btn-sm" on:click={toggleBannedUsers}>
@@ -1160,15 +1181,15 @@
             </div>
             {#if showBannedUsers}
               {#if loadingBans}
-                <p class="text-sm text-secondary" style="margin-top: 8px;">Loading...</p>
+                <p class="text-sm text-secondary" style="margin-top: 8px; display: flex; align-items: center; gap: 6px;"><Spinner size={13} />Loading...</p>
               {:else if bannedUsers.length === 0}
                 <p class="text-sm text-secondary" style="margin-top: 8px;">No banned users.</p>
               {:else}
                 <div style="display: flex; flex-direction: column; gap: 6px; margin-top: 8px;">
                   {#each bannedUsers as ban}
-                    <div style="padding: 10px 12px; background: var(--color-surface-2, #f5f5f5); border-radius: 8px;">
+                    <div class="surface-card">
                       <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
-                        <span style="font-weight: 600;">@{ban.nickname}</span>
+                        <span style="font-weight: 600;">{ban.nickname}</span>
                         <button
                           type="button"
                           class="btn btn-secondary btn-sm"
@@ -1208,7 +1229,9 @@
     <!-- SESSION PAGE -->
     <header class="app-header">
       <div class="app-header-inner">
-        <a class="app-logo" href="/" on:click|preventDefault={() => goto('/')}>QStream</a>
+        <a class="app-logo" href="/" on:click|preventDefault={() => goto('/')}>
+          <img src="/icon-64.webp" alt="" class="app-logo-icon" />qstream
+        </a>
 
         <div class="app-header-right">
           <span class="text-sm text-secondary">
@@ -1233,7 +1256,24 @@
 
     <div class="app-body">
       <div style="margin-bottom: 20px;">
-        <h1>{sessionData?.name || 'Session'}</h1>
+        <div style="display: flex; align-items: center; justify-content: space-between;">
+          <h1 style="margin: 0;">{sessionData?.name || 'Session'}</h1>
+          {#if admin}
+            <button
+              type="button"
+              class="btn btn-secondary btn-sm"
+              class:active={showSessionSettings}
+              on:click={() => { if (showSessionSettings) { showSessionSettings = false } else { openSessionSettings() } }}
+              title="Session settings"
+              style="padding: 6px 8px; flex-shrink: 0;"
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2"/>
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" stroke="currentColor" stroke-width="2"/>
+              </svg>
+            </button>
+          {/if}
+        </div>
         {#if sessionData?.description}
           <p class="text-sm text-secondary" style="margin-top: 4px;">{sessionData.description}</p>
         {/if}
@@ -1251,25 +1291,20 @@
             {/if}
           </p>
         {/if}
-        <div style="margin-top: 8px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-          {#if admin}
-            <p class="text-sm text-secondary">You own this session. Use moderation controls on each question.</p>
-            <button type="button" class="btn btn-ghost btn-sm" on:click={openSessionSettings}>Settings</button>
-          {:else if !currentUser}
-            <p class="text-sm text-secondary">Log in to ask questions and vote.</p>
-          {/if}
-        </div>
+        {#if !currentUser}
+          <p class="text-sm text-secondary" style="margin-top: 8px;">Log in to ask questions and vote.</p>
+        {/if}
       </div>
 
       {#if sessionData && sessionData.is_active === 0}
         <div class="msg msg-info" style="margin-bottom: 16px;">
-          This session has ended. Questions are no longer accepted.
+          This session has ended.
         </div>
       {/if}
 
       {#if viewerIsBanned}
         <div class="msg msg-error" style="margin-bottom: 16px;">
-          You are banned in this session and cannot ask questions or vote.
+          You are banned.
         </div>
       {/if}
 
@@ -1277,43 +1312,16 @@
         <div class="card section-gap" style="margin-bottom: 16px;">
           <h3 style="margin: 0 0 12px;">Session settings</h3>
           <form on:submit={updateSessionSettings}>
-            <div style="display: flex; flex-direction: column; gap: 10px;">
+            <div class="settings-form-body">
+              <SessionDetailsFields
+                prefix="settings"
+                bind:name={settingsName}
+                bind:description={settingsDescription}
+                bind:streamLink={settingsStreamLink}
+              />
               <div>
-                <label for="settings-name" class="text-sm" style="display: block; margin-bottom: 4px;">Name <span style="color: var(--color-danger)">*</span></label>
-                <input
-                  id="settings-name"
-                  type="text"
-                  maxlength="100"
-                  bind:value={settingsName}
-                  placeholder="My Stream Q&A"
-                  style="width: 100%; box-sizing: border-box;"
-                />
-              </div>
-              <div>
-                <label for="settings-description" class="text-sm" style="display: block; margin-bottom: 4px;">Description</label>
-                <textarea
-                  id="settings-description"
-                  maxlength="500"
-                  bind:value={settingsDescription}
-                  placeholder="Short description shown to viewers"
-                  rows="2"
-                  style="width: 100%; box-sizing: border-box;"
-                ></textarea>
-              </div>
-              <div>
-                <label for="settings-stream-link" class="text-sm" style="display: block; margin-bottom: 4px;">Stream link</label>
-                <input
-                  id="settings-stream-link"
-                  type="url"
-                  maxlength="500"
-                  bind:value={settingsStreamLink}
-                  placeholder="https://twitch.tv/yourname"
-                  style="width: 100%; box-sizing: border-box;"
-                />
-              </div>
-              <div>
-                <label for="settings-threshold" class="text-sm" style="display: block; margin-bottom: 4px;">Hide questions below score</label>
-                <div style="display: flex; align-items: center; gap: 8px;">
+                <label for="settings-threshold" class="text-sm field-label">Hide questions below score</label>
+                <div class="flex-row-gap-sm">
                   <input
                     id="settings-threshold"
                     type="number"
@@ -1322,10 +1330,10 @@
                     bind:value={settingsThreshold}
                     style="width: 72px;"
                   />
-                  <span class="text-sm text-secondary">Questions at −{settingsThreshold} or lower move to Downvoted tab</span>
+                  <span class="text-sm text-secondary">Questions at −{settingsThreshold} or lower move to Bad tab</span>
                 </div>
               </div>
-              <div style="display: flex; gap: 8px; align-items: center;">
+              <div class="form-actions">
                 <button type="submit" class="btn btn-primary btn-sm" disabled={settingsBusy}>
                   {settingsBusy ? 'Saving...' : 'Save'}
                 </button>
@@ -1333,12 +1341,12 @@
                   Cancel
                 </button>
                 {#if settingsStatus}
-                  <span class="text-sm" style="color: var(--color-danger);">{settingsStatus}</span>
+                  <span class="text-sm text-danger">{settingsStatus}</span>
                 {/if}
               </div>
 
               {#if sessionData && sessionData.is_active === 1}
-                <div style="border-top: 1px solid var(--color-border, #e0e0e0); margin-top: 14px; padding-top: 14px;">
+                <div class="section-divider-sm">
                   <ConfirmButton
                     class="btn btn-danger btn-sm"
                     label="Stop session"
@@ -1377,7 +1385,7 @@
               <p class="text-sm text-secondary" style="margin: 4px 0 0;">DD - MM - YYYY &nbsp; HH : MM : SS</p>
             </div>
             {#if timecodeLoading}
-              <p class="text-sm text-secondary">Loading questions...</p>
+              <p class="text-sm text-secondary" style="display: flex; align-items: center; gap: 6px;"><Spinner size={13} />Loading questions...</p>
             {:else if timecodeText}
               <div>
                 <label for="timecode-output" class="text-sm" style="display: block; margin-bottom: 4px;">Timecodes</label>
@@ -1445,14 +1453,6 @@
         </div>
       {/if}
 
-      {#if questionStatus}
-        <p class="msg {questionStatus.includes('failed') || questionStatus.includes('Failed') || questionStatus.includes('error') || questionStatus.includes('Error') || questionStatus.includes('cannot') || questionStatus.includes('Cannot') || questionStatus.includes('Only') || questionStatus.includes('Login first') || questionStatus.includes('max length') ? 'msg-error' : 'msg-success'}">{questionStatus}</p>
-      {/if}
-
-      {#if sessionError}
-        <p class="msg msg-error">{sessionError}</p>
-      {/if}
-
       <!-- Toolbar -->
       <div class="toolbar section-gap">
         <div class="tab-bar">
@@ -1473,13 +1473,13 @@
             class="tab"
             class:active={sessionSort === 'answered'}
             on:click={() => changeSort('answered')}
-          >Answered</button>
+          >Done</button>
           <button
             type="button"
             class="tab"
             class:active={sessionSort === 'downvoted'}
             on:click={() => changeSort('downvoted')}
-          >Downvoted</button>
+          >Bad</button>
         </div>
 
         <div class="toolbar-spacer"></div>
@@ -1506,21 +1506,29 @@
           >Manual</button>
         </div>
 
-        <button type="button" class="btn btn-secondary btn-sm" on:click={() => refreshQuestions()}>
-          Refresh
+        <button type="button" class="btn btn-secondary btn-sm refresh-btn" on:click={() => refreshQuestions()} disabled={loadingQuestions} title="Refresh">
+          <span class="refresh-label" class:invisible={loadingQuestions}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M4 12a8 8 0 0 1 14.93-4H15" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M20 12a8 8 0 0 1-14.93 4H9" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </span>
+          {#if loadingQuestions}
+            <span class="refresh-spinner"><Spinner size={13} /></span>
+          {/if}
           {#if pendingNewQuestions > 0}
-            <span class="pending-count">{pendingNewQuestions}</span>
+            <span class="refresh-badge">{pendingNewQuestions}</span>
           {/if}
         </button>
+
       </div>
 
       <!-- Question list -->
-      {#if loadingQuestions}
-        <div class="empty-state">
-          <p class="text-secondary">Loading...</p>
+      {#if sessionSort === 'downvoted' && sessionData && !loadingQuestions}
+        <div class="msg msg-info" style="margin-bottom: 12px; text-align: center;">
+          Questions with a score of −{sessionData.downvote_threshold ?? 5} or lower are hidden from other tabs.
         </div>
       {/if}
-
       <div class="q-list">
         {#if visibleQuestions.length === 0 && !loadingQuestions}
           <div class="empty-state">
@@ -1565,7 +1573,7 @@
               <p class="q-text">{item.body}</p>
 
               <div class="q-meta">
-                <span>@{item.author_nickname}</span>
+                <span>{item.author_nickname}</span>
                 <span class="q-meta-sep">&middot;</span>
                 <span>{formatTime(item.created_at)}</span>
                 <span class="q-meta-sep">&middot;</span>
@@ -1633,6 +1641,8 @@
     </div>
   {/if}
 </div>
+
+<Notifications history={notifHistory} toasts={activeToasts} />
 
 <style>
   .modal-backdrop {

@@ -2,7 +2,11 @@ __DEPLOY_PUBLIC_HOST__ {
     encode zstd gzip
 
     handle /api/* {
-        reverse_proxy 127.0.0.1:__DEPLOY_BACKEND_PORT__
+        reverse_proxy 127.0.0.1:__DEPLOY_BACKEND_PORT__ {
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Real-IP {remote_host}
+            header_up -CF-Connecting-IP
+        }
     }
 
     handle {

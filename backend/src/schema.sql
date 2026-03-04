@@ -77,6 +77,17 @@ CREATE INDEX IF NOT EXISTS idx_votes_question
 CREATE INDEX IF NOT EXISTS idx_votes_user_rate_limit
     ON votes(user_id, updated_at);
 
+CREATE TABLE IF NOT EXISTS vote_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+    value INTEGER NOT NULL CHECK (value IN (-1, 0, 1)),
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE INDEX IF NOT EXISTS idx_vote_actions_user_created_at
+    ON vote_actions(user_id, created_at);
+
 CREATE TABLE IF NOT EXISTS bans (
     owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,

@@ -476,7 +476,13 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("invalid FRONTEND_ORIGIN: {frontend_origin}"))?,
         )
     }
-    .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+    .allow_methods([
+        Method::GET,
+        Method::POST,
+        Method::PUT,
+        Method::DELETE,
+        Method::OPTIONS,
+    ])
     .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
     let app = Router::new()
@@ -484,8 +490,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/me", get(get_me))
         .route("/api/google_oauth2/start", get(google_oauth_start))
         .route("/api/google_oauth2", get(google_oauth_callback))
-        .route("/api/sessions", get(list_user_sessions).post(create_session))
-        .route("/api/sessions/:code", put(update_session).delete(delete_session))
+        .route(
+            "/api/sessions",
+            get(list_user_sessions).post(create_session),
+        )
+        .route(
+            "/api/sessions/:code",
+            put(update_session).delete(delete_session),
+        )
         .route("/api/sessions/:code/stop", post(stop_session))
         .route("/api/bans", get(list_bans))
         .route("/api/bans/:user_id", axum::routing::delete(unban_user))
@@ -786,17 +798,27 @@ async fn create_session(
 
     let description = payload.description.and_then(|d| {
         let t = d.trim().to_string();
-        if t.is_empty() { None } else { Some(t) }
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
     });
     if let Some(ref d) = description {
         if d.chars().count() > 500 {
-            return Err(AppError::bad_request("description cannot exceed 500 characters"));
+            return Err(AppError::bad_request(
+                "description cannot exceed 500 characters",
+            ));
         }
     }
 
     let stream_link = payload.stream_link.and_then(|l| {
         let t = l.trim().to_string();
-        if t.is_empty() { None } else { Some(t) }
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
     });
     if let Some(ref l) = stream_link {
         if !l.starts_with("http://") && !l.starts_with("https://") {
@@ -805,11 +827,16 @@ async fn create_session(
             ));
         }
         if l.len() > 500 {
-            return Err(AppError::bad_request("stream_link cannot exceed 500 characters"));
+            return Err(AppError::bad_request(
+                "stream_link cannot exceed 500 characters",
+            ));
         }
     }
 
-    let downvote_threshold = payload.downvote_threshold.map(|t| t.clamp(1, 1000)).unwrap_or(5);
+    let downvote_threshold = payload
+        .downvote_threshold
+        .map(|t| t.clamp(1, 1000))
+        .unwrap_or(5);
 
     let mut inserted_id: Option<i64> = None;
     for _ in 0..8 {
@@ -885,10 +912,18 @@ async fn list_questions(
     let viewer_user_id = optional_auth_user_id(&state, &headers).await;
 
     let raw_sort = query.sort.as_deref().unwrap_or("top");
-    let sort = QuestionSort::parse(raw_sort)
-        .ok_or_else(|| AppError::bad_request("sort must be 'top', 'new', 'answered', or 'downvoted'"))?;
+    let sort = QuestionSort::parse(raw_sort).ok_or_else(|| {
+        AppError::bad_request("sort must be 'top', 'new', 'answered', or 'downvoted'")
+    })?;
 
-    let questions = list_questions_for_session(&state.db, session.id, sort, viewer_user_id, session.downvote_threshold).await?;
+    let questions = list_questions_for_session(
+        &state.db,
+        session.id,
+        sort,
+        viewer_user_id,
+        session.downvote_threshold,
+    )
+    .await?;
 
     let (question_cooldown_remaining, viewer_is_banned) = if let Some(uid) = viewer_user_id {
         let row: (Option<i64>, i64) = sqlx::query_as(
@@ -996,14 +1031,6 @@ fn resolve_request_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
         return addr.ip();
     }
 
-    if let Some(ip) = parse_ip_header(headers.get("cf-connecting-ip")) {
-        return ip;
-    }
-
-    if let Some(ip) = parse_ip_header(headers.get("x-real-ip")) {
-        return ip;
-    }
-
     if let Some(value) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
         if let Some(ip) = value
             .split(',')
@@ -1017,12 +1044,6 @@ fn resolve_request_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
     }
 
     addr.ip()
-}
-
-fn parse_ip_header(value: Option<&HeaderValue>) -> Option<IpAddr> {
-    value
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<IpAddr>().ok())
 }
 
 /// A stream wrapper that decrements the SSE connection count when dropped.
@@ -1094,35 +1115,17 @@ async fn create_question(
         ));
     }
 
-    let last_question_at: Option<i64> = sqlx::query_scalar(
-        r#"
-        SELECT CAST(created_at AS INTEGER)
-        FROM questions
-        WHERE session_id = ?1 AND author_user_id = ?2
-        ORDER BY CAST(created_at AS INTEGER) DESC
-        LIMIT 1;
-        "#,
-    )
-    .bind(session.id)
-    .bind(auth.user_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|err| AppError::internal(format!("failed to check question rate limit: {err}")))?;
-
-    if let Some(last_ts) = last_question_at {
-        let now = now_unix();
-        if now - last_ts < 60 {
-            tracing::warn!(user_id = auth.user_id, session = %code, "question rate limit hit");
-            return Err(AppError::too_many_requests(
-                "you can post only one question per minute",
-            ));
-        }
-    }
-
     let insert = sqlx::query(
         r#"
         INSERT INTO questions (session_id, author_user_id, body, created_at)
-        VALUES (?1, ?2, ?3, unixepoch());
+        SELECT ?1, ?2, ?3, unixepoch()
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM questions
+            WHERE session_id = ?1
+              AND author_user_id = ?2
+              AND CAST(created_at AS INTEGER) > unixepoch() - 60
+        );
         "#,
     )
     .bind(session.id)
@@ -1131,6 +1134,13 @@ async fn create_question(
     .execute(&state.db)
     .await
     .map_err(|err| AppError::internal(format!("failed to create question: {err}")))?;
+
+    if insert.rows_affected() == 0 {
+        tracing::warn!(user_id = auth.user_id, session = %code, "question rate limit hit");
+        return Err(AppError::too_many_requests(
+            "you can post only one question per minute",
+        ));
+    }
 
     let question_id = insert.last_insert_rowid();
     let question = fetch_question_by_id(&state.db, question_id).await?;
@@ -1204,37 +1214,59 @@ async fn vote_question(
         return Err(AppError::forbidden("you are banned in this session"));
     }
 
-    // Vote rate limiting: max 200 votes per minute
-    let vote_count: i64 = sqlx::query_scalar(
+    let mut tx =
+        state.db.begin().await.map_err(|err| {
+            AppError::internal(format!("failed to start vote transaction: {err}"))
+        })?;
+
+    // Vote action rate limiting: max 200 actions per minute.
+    sqlx::query(
         r#"
-        SELECT COUNT(*) FROM votes
-        WHERE user_id = ?1 AND updated_at > unixepoch() - 60;
+        INSERT INTO vote_actions (user_id, question_id, value, created_at)
+        VALUES (?1, ?2, ?3, unixepoch());
         "#,
     )
     .bind(auth.user_id)
-    .fetch_one(&state.db)
+    .bind(question_id)
+    .bind(payload.value)
+    .execute(&mut *tx)
     .await
-    .map_err(|err| AppError::internal(format!("failed to check vote rate limit: {err}")))?;
+    .map_err(|err| AppError::internal(format!("failed to record vote action: {err}")))?;
 
-    if vote_count >= 200 {
+    let vote_action_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*) FROM vote_actions
+        WHERE user_id = ?1 AND created_at > unixepoch() - 60;
+        "#,
+    )
+    .bind(auth.user_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to check vote action rate limit: {err}")))?;
+
+    if vote_action_count > 200 {
+        tx.rollback().await.ok();
         tracing::warn!(
             user_id = auth.user_id,
-            "vote rate limit hit ({vote_count}/min)"
+            "vote action rate limit hit ({vote_action_count}/min)"
         );
         return Err(AppError::too_many_requests(
             "too many votes, please slow down",
         ));
     }
 
-    if payload.value == 0 {
-        sqlx::query(
-            "DELETE FROM votes WHERE question_id = ?1 AND user_id = ?2;",
-        )
-        .bind(question_id)
-        .bind(auth.user_id)
-        .execute(&state.db)
+    sqlx::query("DELETE FROM vote_actions WHERE created_at <= unixepoch() - 86400;")
+        .execute(&mut *tx)
         .await
-        .map_err(|err| AppError::internal(format!("failed to remove vote: {err}")))?;
+        .map_err(|err| AppError::internal(format!("failed to cleanup vote actions: {err}")))?;
+
+    if payload.value == 0 {
+        sqlx::query("DELETE FROM votes WHERE question_id = ?1 AND user_id = ?2;")
+            .bind(question_id)
+            .bind(auth.user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| AppError::internal(format!("failed to remove vote: {err}")))?;
     } else {
         sqlx::query(
             r#"
@@ -1248,7 +1280,7 @@ async fn vote_question(
         .bind(question_id)
         .bind(auth.user_id)
         .bind(payload.value)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|err| AppError::internal(format!("failed to save vote: {err}")))?;
     }
@@ -1261,9 +1293,13 @@ async fn vote_question(
         "#,
     )
     .bind(question_id)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|err| AppError::internal(format!("failed to recalculate score: {err}")))?;
+
+    tx.commit()
+        .await
+        .map_err(|err| AppError::internal(format!("failed to commit vote transaction: {err}")))?;
 
     tracing::info!(
         question_id,
@@ -1482,7 +1518,9 @@ async fn moderate_question(
             .bind(meta.author_user_id)
             .execute(&state.db)
             .await
-            .map_err(|err| AppError::internal(format!("failed to delete banned user questions: {err}")))?;
+            .map_err(|err| {
+                AppError::internal(format!("failed to delete banned user questions: {err}"))
+            })?;
 
             tracing::info!(
                 question_id,
@@ -1560,11 +1598,13 @@ async fn stop_session(
         return Err(AppError::bad_request("session is already stopped"));
     }
 
-    sqlx::query("UPDATE stream_sessions SET is_active = 0, stopped_at = unixepoch() WHERE id = ?1;")
-        .bind(session.id)
-        .execute(&state.db)
-        .await
-        .map_err(|err| AppError::internal(format!("failed to stop session: {err}")))?;
+    sqlx::query(
+        "UPDATE stream_sessions SET is_active = 0, stopped_at = unixepoch() WHERE id = ?1;",
+    )
+    .bind(session.id)
+    .execute(&state.db)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to stop session: {err}")))?;
 
     tracing::info!(session_id = session.id, code = %code, "session stopped");
     state
@@ -1612,7 +1652,9 @@ async fn update_session(
     let session = find_session_by_code(&state.db, &code).await?;
 
     if session.owner_user_id != auth.user_id {
-        return Err(AppError::forbidden("only session owner can update session info"));
+        return Err(AppError::forbidden(
+            "only session owner can update session info",
+        ));
     }
 
     let name = payload.name.trim().to_string();
@@ -1623,32 +1665,47 @@ async fn update_session(
         return Err(AppError::bad_request("name cannot exceed 100 characters"));
     }
 
-    let description = payload.description.map(|d| {
+    let description = payload.description.and_then(|d| {
         let t = d.trim().to_string();
-        if t.is_empty() { None } else { Some(t) }
-    }).flatten();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
+    });
 
     if let Some(ref d) = description {
         if d.chars().count() > 500 {
-            return Err(AppError::bad_request("description cannot exceed 500 characters"));
+            return Err(AppError::bad_request(
+                "description cannot exceed 500 characters",
+            ));
         }
     }
 
-    let stream_link = payload.stream_link.map(|l| {
+    let stream_link = payload.stream_link.and_then(|l| {
         let t = l.trim().to_string();
-        if t.is_empty() { None } else { Some(t) }
-    }).flatten();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
+    });
 
     if let Some(ref l) = stream_link {
         if !l.starts_with("http://") && !l.starts_with("https://") {
-            return Err(AppError::bad_request("stream_link must start with http:// or https://"));
+            return Err(AppError::bad_request(
+                "stream_link must start with http:// or https://",
+            ));
         }
         if l.len() > 500 {
-            return Err(AppError::bad_request("stream_link cannot exceed 500 characters"));
+            return Err(AppError::bad_request(
+                "stream_link cannot exceed 500 characters",
+            ));
         }
     }
 
-    let downvote_threshold = payload.downvote_threshold
+    let downvote_threshold = payload
+        .downvote_threshold
         .map(|t| t.clamp(1, 1000))
         .unwrap_or(session.downvote_threshold);
 
@@ -1902,7 +1959,11 @@ async fn fetch_question_by_id(db: &SqlitePool, question_id: i64) -> Result<Quest
     .ok_or_else(|| AppError::not_found("question not found"))
 }
 
-async fn is_user_banned(db: &SqlitePool, owner_user_id: i64, user_id: i64) -> Result<bool, AppError> {
+async fn is_user_banned(
+    db: &SqlitePool,
+    owner_user_id: i64,
+    user_id: i64,
+) -> Result<bool, AppError> {
     let banned: Option<i64> = sqlx::query_scalar(
         r#"
         SELECT 1

@@ -123,6 +123,7 @@ Server-Sent Events (SSE) for fan-out updates. Regular HTTP for all writes. Debou
 
 ## Security and Abuse Controls
 - Google OAuth for identity (no passwords, no email stored).
+- Session persistence is prioritized over strict auth hardening: long-lived authorized sessions are an intentional UX choice to avoid frequent re-login friction for streamer/viewers.
 - Rate limits: one question per minute per user per session; 200 votes per minute per user.
 - Per-IP SSE connection limit.
 - Input validation and length limits (questions: 1–300 chars).

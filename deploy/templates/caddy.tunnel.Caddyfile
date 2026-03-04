@@ -2,7 +2,11 @@ __PUBLIC_HOST__ {
     encode zstd gzip
 
     # API from local machine via SSH reverse tunnel
-    reverse_proxy /api/* __TUNNEL_UPSTREAM_HOST__:__REMOTE_BACKEND_INTERNAL_PORT__
+    reverse_proxy /api/* __TUNNEL_UPSTREAM_HOST__:__REMOTE_BACKEND_INTERNAL_PORT__ {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+        header_up -CF-Connecting-IP
+    }
 
     # Frontend from local machine via SSH reverse tunnel
     reverse_proxy __TUNNEL_UPSTREAM_HOST__:__REMOTE_FRONTEND_INTERNAL_PORT__

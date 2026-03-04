@@ -923,7 +923,6 @@
       })
       sessionData = payload
       showSessionSettings = false
-      showStopConfirm = false
     } catch (error) {
       settingsStatus = error instanceof Error ? error.message : 'Failed to stop session.'
     } finally {
@@ -1256,8 +1255,7 @@
           {#if admin}
             <p class="text-sm text-secondary">You own this session. Use moderation controls on each question.</p>
             <button type="button" class="btn btn-ghost btn-sm" on:click={openSessionSettings}>Settings</button>
-          {:else if currentUser}
-          {:else}
+          {:else if !currentUser}
             <p class="text-sm text-secondary">Log in to ask questions and vote.</p>
           {/if}
         </div>
@@ -1331,7 +1329,7 @@
                 <button type="submit" class="btn btn-primary btn-sm" disabled={settingsBusy}>
                   {settingsBusy ? 'Saving...' : 'Save'}
                 </button>
-                <button type="button" class="btn btn-ghost btn-sm" on:click={() => { showSessionSettings = false; showStopConfirm = false }}>
+                <button type="button" class="btn btn-ghost btn-sm" on:click={() => { showSessionSettings = false }}>
                   Cancel
                 </button>
                 {#if settingsStatus}
@@ -1406,7 +1404,7 @@
       {#if !currentUser && showSessionLogin}
         <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
         <div class="modal-backdrop" on:click={() => (showSessionLogin = false)}>
-          <div class="modal-card" on:click|stopPropagation role="dialog" aria-modal="true">
+          <div class="modal-card" on:click|stopPropagation role="dialog" aria-modal="true" tabindex="-1">
             <button class="modal-close" type="button" aria-label="Close" on:click={() => (showSessionLogin = false)}>✕</button>
             <LoginPanel
               {apiBase}

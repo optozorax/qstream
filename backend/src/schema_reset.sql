@@ -1,6 +1,7 @@
 PRAGMA foreign_keys = OFF;
 
 DROP TABLE IF EXISTS bans;
+DROP TABLE IF EXISTS vote_actions;
 DROP TABLE IF EXISTS votes;
 DROP TABLE IF EXISTS questions;
 DROP TABLE IF EXISTS stream_sessions;

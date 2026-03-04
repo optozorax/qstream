@@ -195,6 +195,7 @@ struct CreateSessionRequest {
     name: String,
     description: Option<String>,
     stream_link: Option<String>,
+    downvote_threshold: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -231,6 +232,7 @@ struct StreamSession {
     description: Option<String>,
     stream_link: Option<String>,
     stopped_at: Option<i64>,
+    downvote_threshold: i64,
 }
 
 #[derive(Deserialize)]
@@ -238,6 +240,7 @@ struct UpdateSessionRequest {
     name: String,
     description: Option<String>,
     stream_link: Option<String>,
+    downvote_threshold: Option<i64>,
 }
 
 #[derive(Serialize, FromRow)]
@@ -288,6 +291,21 @@ struct ListQuestionsResponse {
     sort: String,
     questions: Vec<QuestionView>,
     question_cooldown_remaining: i64,
+    viewer_is_banned: bool,
+}
+
+#[derive(Serialize, FromRow)]
+struct BannedUser {
+    user_id: i64,
+    nickname: String,
+    banned_at: i64,
+    question_body: Option<String>,
+    session_name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ListBansResponse {
+    bans: Vec<BannedUser>,
 }
 
 #[derive(Serialize)]
@@ -342,6 +360,7 @@ enum QuestionSort {
     Top,
     New,
     Answered,
+    Downvoted,
 }
 
 impl QuestionSort {
@@ -350,6 +369,7 @@ impl QuestionSort {
             "top" | "popular" => Some(Self::Top),
             "new" => Some(Self::New),
             "answered" => Some(Self::Answered),
+            "downvoted" => Some(Self::Downvoted),
             _ => None,
         }
     }
@@ -359,6 +379,7 @@ impl QuestionSort {
             Self::Top => "top",
             Self::New => "new",
             Self::Answered => "answered",
+            Self::Downvoted => "downvoted",
         }
     }
 }
@@ -466,6 +487,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/sessions", get(list_user_sessions).post(create_session))
         .route("/api/sessions/:code", put(update_session).delete(delete_session))
         .route("/api/sessions/:code/stop", post(stop_session))
+        .route("/api/bans", get(list_bans))
+        .route("/api/bans/:user_id", axum::routing::delete(unban_user))
         .route("/api/sessions/:code/events", get(session_events_handler))
         .route(
             "/api/sessions/:code/questions",
@@ -513,6 +536,8 @@ async fn init_db(db: &SqlitePool, reset_db_on_boot: bool) -> anyhow::Result<()> 
     ensure_session_metadata_schema(db).await?;
     ensure_multi_session_schema(db).await?;
     ensure_timestamps_schema(db).await?;
+    ensure_bans_owner_schema(db).await?;
+    ensure_downvote_threshold_schema(db).await?;
 
     Ok(())
 }
@@ -572,6 +597,95 @@ async fn ensure_session_metadata_schema(db: &SqlitePool) -> anyhow::Result<()> {
             .await?;
         }
     }
+    Ok(())
+}
+
+async fn ensure_downvote_threshold_schema(db: &SqlitePool) -> anyhow::Result<()> {
+    let has_col: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('stream_sessions') WHERE name = 'downvote_threshold' LIMIT 1;",
+    )
+    .fetch_optional(db)
+    .await?;
+
+    if has_col.is_none() {
+        sqlx::query(
+            "ALTER TABLE stream_sessions ADD COLUMN downvote_threshold INTEGER NOT NULL DEFAULT 5;",
+        )
+        .execute(db)
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn ensure_bans_owner_schema(db: &SqlitePool) -> anyhow::Result<()> {
+    // Check if still on old session-scoped schema
+    let has_session_id: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('bans') WHERE name = 'session_id' LIMIT 1;",
+    )
+    .fetch_optional(db)
+    .await?;
+
+    if has_session_id.is_none() {
+        return Ok(()); // Already on new owner-scoped schema
+    }
+
+    let has_question_id: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('bans') WHERE name = 'question_id' LIMIT 1;",
+    )
+    .fetch_optional(db)
+    .await?;
+
+    let mut conn = db.acquire().await?;
+    sqlx::query("PRAGMA foreign_keys = OFF;")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE bans_new (
+            owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            question_id INTEGER REFERENCES questions(id),
+            reason TEXT,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            PRIMARY KEY (owner_user_id, user_id)
+        );
+        "#,
+    )
+    .execute(&mut *conn)
+    .await?;
+
+    if has_question_id.is_some() {
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO bans_new (owner_user_id, user_id, question_id, reason, created_at)
+            SELECT s.owner_user_id, b.user_id, b.question_id, b.reason, b.created_at
+            FROM bans b JOIN stream_sessions s ON s.id = b.session_id;
+            "#,
+        )
+        .execute(&mut *conn)
+        .await?;
+    } else {
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO bans_new (owner_user_id, user_id, reason, created_at)
+            SELECT s.owner_user_id, b.user_id, b.reason, b.created_at
+            FROM bans b JOIN stream_sessions s ON s.id = b.session_id;
+            "#,
+        )
+        .execute(&mut *conn)
+        .await?;
+    }
+
+    sqlx::query("DROP TABLE bans;").execute(&mut *conn).await?;
+    sqlx::query("ALTER TABLE bans_new RENAME TO bans;")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("PRAGMA foreign_keys = ON;")
+        .execute(&mut *conn)
+        .await?;
+
+    tracing::info!("migrated bans: switched from session-scoped to owner-scoped");
     Ok(())
 }
 
@@ -885,7 +999,8 @@ async fn list_user_sessions(
             name,
             description,
             stream_link,
-            stopped_at
+            stopped_at,
+            downvote_threshold
         FROM stream_sessions
         WHERE owner_user_id = ?1
         ORDER BY CAST(created_at AS INTEGER) DESC;
@@ -939,13 +1054,15 @@ async fn create_session(
         }
     }
 
+    let downvote_threshold = payload.downvote_threshold.map(|t| t.clamp(1, 1000)).unwrap_or(5);
+
     let mut inserted_id: Option<i64> = None;
     for _ in 0..8 {
         let public_code = generate_session_code();
         let res = sqlx::query(
             r#"
-            INSERT INTO stream_sessions (owner_user_id, public_code, created_at, is_active, name, description, stream_link)
-            VALUES (?1, ?2, unixepoch(), 1, ?3, ?4, ?5);
+            INSERT INTO stream_sessions (owner_user_id, public_code, created_at, is_active, name, description, stream_link, downvote_threshold)
+            VALUES (?1, ?2, unixepoch(), 1, ?3, ?4, ?5, ?6);
             "#,
         )
         .bind(auth.user_id)
@@ -953,6 +1070,7 @@ async fn create_session(
         .bind(&name)
         .bind(&description)
         .bind(&stream_link)
+        .bind(downvote_threshold)
         .execute(&state.db)
         .await;
 
@@ -984,7 +1102,8 @@ async fn create_session(
             name,
             description,
             stream_link,
-            stopped_at
+            stopped_at,
+            downvote_threshold
         FROM stream_sessions
         WHERE id = ?1;
         "#,
@@ -1012,9 +1131,9 @@ async fn list_questions(
 
     let raw_sort = query.sort.as_deref().unwrap_or("top");
     let sort = QuestionSort::parse(raw_sort)
-        .ok_or_else(|| AppError::bad_request("sort must be 'top', 'new', or 'answered'"))?;
+        .ok_or_else(|| AppError::bad_request("sort must be 'top', 'new', 'answered', or 'downvoted'"))?;
 
-    let questions = list_questions_for_session(&state.db, session.id, sort, viewer_user_id).await?;
+    let questions = list_questions_for_session(&state.db, session.id, sort, viewer_user_id, session.downvote_threshold).await?;
 
     let question_cooldown_remaining = if let Some(uid) = viewer_user_id {
         let last_at: Option<i64> = sqlx::query_scalar(
@@ -1037,11 +1156,18 @@ async fn list_questions(
         0
     };
 
+    let viewer_is_banned = if let Some(uid) = viewer_user_id {
+        is_user_banned(&state.db, session.owner_user_id, uid).await.unwrap_or(false)
+    } else {
+        false
+    };
+
     Ok(Json(ListQuestionsResponse {
         session,
         sort: sort.as_str().to_string(),
         questions,
         question_cooldown_remaining,
+        viewer_is_banned,
     }))
 }
 
@@ -1205,7 +1331,7 @@ async fn create_question(
         return Err(AppError::forbidden("session is stopped"));
     }
 
-    if is_user_banned(&state.db, session.id, auth.user_id).await? {
+    if is_user_banned(&state.db, session.owner_user_id, auth.user_id).await? {
         return Err(AppError::forbidden("you are banned in this session"));
     }
 
@@ -1323,7 +1449,7 @@ async fn vote_question(
         return Err(AppError::bad_request("cannot vote for deleted questions"));
     }
 
-    if is_user_banned(&state.db, question_meta.session_id, auth.user_id).await? {
+    if is_user_banned(&state.db, question_meta.owner_user_id, auth.user_id).await? {
         return Err(AppError::forbidden("you are banned in this session"));
     }
 
@@ -1582,30 +1708,47 @@ async fn moderate_question(
 
             sqlx::query(
                 r#"
-                INSERT INTO bans (session_id, user_id, created_at)
-                VALUES (?1, ?2, unixepoch())
-                ON CONFLICT(session_id, user_id) DO NOTHING;
+                INSERT INTO bans (owner_user_id, user_id, question_id, created_at)
+                VALUES (?1, ?2, ?3, unixepoch())
+                ON CONFLICT(owner_user_id, user_id) DO NOTHING;
+                "#,
+            )
+            .bind(auth.user_id)
+            .bind(meta.author_user_id)
+            .bind(question_id)
+            .execute(&state.db)
+            .await
+            .map_err(|err| AppError::internal(format!("failed to ban user: {err}")))?;
+
+            sqlx::query(
+                r#"
+                UPDATE questions
+                SET is_deleted = 1
+                WHERE session_id = ?1 AND author_user_id = ?2 AND is_deleted = 0;
                 "#,
             )
             .bind(meta.session_id)
             .bind(meta.author_user_id)
             .execute(&state.db)
             .await
-            .map_err(|err| AppError::internal(format!("failed to ban user: {err}")))?;
+            .map_err(|err| AppError::internal(format!("failed to delete banned user questions: {err}")))?;
 
-            let question = fetch_question_by_id(&state.db, question_id).await?;
             tracing::info!(
                 question_id,
                 user_id = auth.user_id,
                 banned_user = meta.author_user_id,
-                "user banned"
+                "user banned and questions deleted"
             );
+            state
+                .session_events
+                .publish(meta.session_id, SessionEvent::resync())
+                .await;
 
             Ok(Json(ModerateQuestionResponse {
                 question_id,
                 deleted: false,
                 banned: true,
-                question: Some(question),
+                question: None,
             }))
         }
         "reopen" => {
@@ -1754,24 +1897,73 @@ async fn update_session(
         }
     }
 
+    let downvote_threshold = payload.downvote_threshold
+        .map(|t| t.clamp(1, 1000))
+        .unwrap_or(session.downvote_threshold);
+
     sqlx::query(
         r#"
         UPDATE stream_sessions
-        SET name = ?1, description = ?2, stream_link = ?3
-        WHERE id = ?4;
+        SET name = ?1, description = ?2, stream_link = ?3, downvote_threshold = ?4
+        WHERE id = ?5;
         "#,
     )
     .bind(&name)
     .bind(&description)
     .bind(&stream_link)
+    .bind(downvote_threshold)
     .bind(session.id)
     .execute(&state.db)
     .await
     .map_err(|err| AppError::internal(format!("failed to update session: {err}")))?;
 
-    tracing::info!(session_id = session.id, %name, "session metadata updated");
+    tracing::info!(session_id = session.id, %name, downvote_threshold, "session metadata updated");
     let updated = find_session_by_code(&state.db, &code).await?;
     Ok(Json(updated))
+}
+
+async fn list_bans(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ListBansResponse>, AppError> {
+    let auth = require_auth_user(&state, &headers).await?;
+
+    let bans = sqlx::query_as::<_, BannedUser>(
+        r#"
+        SELECT b.user_id, u.nickname, CAST(b.created_at AS INTEGER) AS banned_at,
+               q.body AS question_body, ss.name AS session_name
+        FROM bans b
+        JOIN users u ON u.id = b.user_id
+        LEFT JOIN questions q ON q.id = b.question_id
+        LEFT JOIN stream_sessions ss ON ss.id = q.session_id
+        WHERE b.owner_user_id = ?1
+        ORDER BY CAST(b.created_at AS INTEGER) DESC;
+        "#,
+    )
+    .bind(auth.user_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to list bans: {err}")))?;
+
+    Ok(Json(ListBansResponse { bans }))
+}
+
+async fn unban_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<i64>,
+) -> Result<StatusCode, AppError> {
+    let auth = require_auth_user(&state, &headers).await?;
+
+    sqlx::query("DELETE FROM bans WHERE owner_user_id = ?1 AND user_id = ?2;")
+        .bind(auth.user_id)
+        .bind(user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to unban user: {err}")))?;
+
+    tracing::info!(owner_id = auth.user_id, user_id, "user unbanned");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn optional_auth_user_id(state: &AppState, headers: &HeaderMap) -> Option<i64> {
@@ -1842,7 +2034,8 @@ async fn find_session_by_code(db: &SqlitePool, code: &str) -> Result<StreamSessi
             name,
             description,
             stream_link,
-            stopped_at
+            stopped_at,
+            downvote_threshold
         FROM stream_sessions
         WHERE public_code = ?1
         LIMIT 1;
@@ -1860,19 +2053,30 @@ async fn list_questions_for_session(
     session_id: i64,
     sort: QuestionSort,
     viewer_user_id: Option<i64>,
+    downvote_threshold: i64,
 ) -> Result<Vec<QuestionView>, AppError> {
-    let (filter, order_by) = match sort {
+    let threshold = downvote_threshold.max(1);
+
+    let (filter, having, order_by): (&str, String, &str) = match sort {
         QuestionSort::Answered => (
             "WHERE q.session_id = ?1 AND (q.is_answered = 1 OR q.is_rejected = 1) AND q.is_deleted = 0",
+            String::new(),
             "ORDER BY CAST(q.created_at AS INTEGER) DESC",
         ),
         QuestionSort::New => (
             "WHERE q.session_id = ?1 AND q.is_answered = 0 AND q.is_rejected = 0 AND q.is_deleted = 0",
+            format!("HAVING score > -{threshold} OR q.is_answering = 1"),
             "ORDER BY q.is_answering DESC, CAST(q.created_at AS INTEGER) DESC",
         ),
         QuestionSort::Top => (
             "WHERE q.session_id = ?1 AND q.is_answered = 0 AND q.is_rejected = 0 AND q.is_deleted = 0",
+            format!("HAVING score > -{threshold} OR q.is_answering = 1"),
             "ORDER BY q.is_answering DESC, score DESC, CAST(q.created_at AS INTEGER) DESC",
+        ),
+        QuestionSort::Downvoted => (
+            "WHERE q.session_id = ?1 AND q.is_answered = 0 AND q.is_rejected = 0 AND q.is_deleted = 0 AND q.is_answering = 0",
+            format!("HAVING score <= -{threshold}"),
+            "ORDER BY score ASC, CAST(q.created_at AS INTEGER) DESC",
         ),
     };
 
@@ -1900,6 +2104,7 @@ async fn list_questions_for_session(
         LEFT JOIN votes uv ON uv.question_id = q.id AND uv.user_id = ?2
         {filter}
         GROUP BY q.id, q.session_id, q.author_user_id, u.nickname, q.body, q.is_answering, q.is_answered, q.is_rejected, q.is_deleted, q.created_at
+        {having}
         {order_by};
         "#
     );
@@ -1946,16 +2151,16 @@ async fn fetch_question_by_id(db: &SqlitePool, question_id: i64) -> Result<Quest
     .ok_or_else(|| AppError::not_found("question not found"))
 }
 
-async fn is_user_banned(db: &SqlitePool, session_id: i64, user_id: i64) -> Result<bool, AppError> {
+async fn is_user_banned(db: &SqlitePool, owner_user_id: i64, user_id: i64) -> Result<bool, AppError> {
     let banned: Option<i64> = sqlx::query_scalar(
         r#"
         SELECT 1
         FROM bans
-        WHERE session_id = ?1 AND user_id = ?2
+        WHERE owner_user_id = ?1 AND user_id = ?2
         LIMIT 1;
         "#,
     )
-    .bind(session_id)
+    .bind(owner_user_id)
     .bind(user_id)
     .fetch_optional(db)
     .await

@@ -73,7 +73,24 @@
   let settingsStreamLink = ''
   let settingsBusy = false
   let settingsStatus = ''
+  let settingsThreshold = 5
   let stoppingSession = false
+
+  // Timecodes panel (admin, ended session)
+  let timecodeDay = 1
+  let timecodeMonth = 1
+  let timecodeYear = 2024
+  let timecodeHour = 0
+  let timecodeMinute = 0
+  let timecodeSecond = 0
+  let timecodeQuestions = []
+  let timecodeLoading = false
+  let timecodeCopied = false
+  let timecodeQuestionsLoaded = false
+  let bannedUsers = []
+  let loadingBans = false
+  let unbanningUserId = null
+  let showBannedUsers = false
 
   // Home page: deleting a session
   let deletingSessionCode = null
@@ -83,6 +100,7 @@
   let questions = []
   let loadingQuestions = false
   let sessionError = ''
+  let viewerIsBanned = false
 
   let questionText = ''
   let questionStatus = ''
@@ -173,7 +191,19 @@
     settingsStatus = ''
     stoppingSession = false
     newQuestionId = null
+    viewerIsBanned = false
+    timecodeDay = 1
+    timecodeMonth = 1
+    timecodeYear = 2024
+    timecodeHour = 0
+    timecodeMinute = 0
+    timecodeSecond = 0
+    timecodeQuestions = []
+    timecodeLoading = false
+    timecodeCopied = false
+    timecodeQuestionsLoaded = false
     if (newQuestionTimer !== null) { clearTimeout(newQuestionTimer); newQuestionTimer = null }
+    void fetchUserSessions()
   }
 
   $: if (route.name === 'session' && sessionData) {
@@ -289,6 +319,8 @@
     authToken = ''
     currentUser = null
     userSessions = []
+    bannedUsers = []
+    showBannedUsers = false
     localVotes = {}
     interactedQuestionIds = new Set()
     hideInteracted = false
@@ -418,7 +450,6 @@
             localVotes = {}
             loadInteractedQuestions(route.code)
           } else {
-            homeMessage = 'Logged in successfully.'
             void fetchUserSessions()
           }
         }
@@ -516,7 +547,7 @@
     updateMode = 'manual'
     updateModeTouched = false
     pendingNewQuestions = 0
-    if (!['top', 'new', 'answered'].includes(sessionSort)) {
+    if (!['top', 'new', 'answered', 'downvoted'].includes(sessionSort)) {
       sessionSort = 'top'
     }
     localVotes = {}
@@ -629,6 +660,7 @@
         if (q.user_vote !== 0) serverVotes[q.id] = q.user_vote
       }
       localVotes = serverVotes
+      viewerIsBanned = payload.viewer_is_banned ?? false
       if (payload.question_cooldown_remaining > 0 && questionCooldownRemaining === 0) {
         startQuestionCooldown(payload.question_cooldown_remaining)
       }
@@ -753,7 +785,8 @@
     !!currentUser &&
     !!sessionData &&
     sessionData.is_active === 1 &&
-    currentUser.id !== sessionData.owner_user_id
+    currentUser.id !== sessionData.owner_user_id &&
+    !viewerIsBanned
 
   async function moderateQuestion(questionId, action) {
     if (!authToken) {
@@ -780,7 +813,7 @@
         questionStatus = 'Question deleted.'
         await refreshQuestions()
       } else if (payload.banned) {
-        questionStatus = 'User banned.'
+        questionStatus = 'User banned. Questions deleted.'
         await refreshQuestions()
       } else if (payload.question) {
         if (action === 'answer') {
@@ -823,7 +856,8 @@
         body: JSON.stringify({
           name,
           description: settingsDescription.trim() || null,
-          stream_link: settingsStreamLink.trim() || null
+          stream_link: settingsStreamLink.trim() || null,
+          downvote_threshold: Math.max(1, Math.min(1000, Math.round(Number(settingsThreshold) || 5)))
         }),
         auth: true
       })
@@ -841,8 +875,43 @@
     settingsName = sessionData?.name ?? ''
     settingsDescription = sessionData?.description ?? ''
     settingsStreamLink = sessionData?.stream_link ?? ''
+    settingsThreshold = sessionData?.downvote_threshold ?? 5
     settingsStatus = ''
     showSessionSettings = true
+  }
+
+  async function loadBans() {
+    loadingBans = true
+    try {
+      const payload = await apiRequest('/api/bans', { auth: true })
+      bannedUsers = payload.bans ?? []
+    } catch {
+      // silently ignore
+    } finally {
+      loadingBans = false
+    }
+  }
+
+  function toggleBannedUsers() {
+    showBannedUsers = !showBannedUsers
+    if (showBannedUsers) {
+      void loadBans()
+    }
+  }
+
+  async function unbanUser(userId) {
+    unbanningUserId = userId
+    try {
+      await apiRequest(`/api/bans/${userId}`, {
+        method: 'DELETE',
+        auth: true
+      })
+      bannedUsers = bannedUsers.filter((b) => b.user_id !== userId)
+    } catch (error) {
+      homeMessage = error instanceof Error ? error.message : 'Failed to unban user.'
+    } finally {
+      unbanningUserId = null
+    }
   }
 
   async function stopSession() {
@@ -905,6 +974,69 @@
     const hr = Math.floor(min / 60)
     const remMin = min % 60
     return remMin > 0 ? `${hr}h ${remMin}m` : `${hr}h`
+  }
+
+  function setTimecodeStartFromUnix(unixTime) {
+    const d = new Date(unixTime * 1000)
+    timecodeDay = d.getDate()
+    timecodeMonth = d.getMonth() + 1
+    timecodeYear = d.getFullYear()
+    timecodeHour = d.getHours()
+    timecodeMinute = d.getMinutes()
+    timecodeSecond = d.getSeconds()
+  }
+
+  function formatTimecode(totalSeconds) {
+    if (totalSeconds < 0) totalSeconds = 0
+    const h = Math.floor(totalSeconds / 3600)
+    const m = Math.floor((totalSeconds % 3600) / 60)
+    const s = Math.floor(totalSeconds % 60)
+    const pad = (n) => String(n).padStart(2, '0')
+    if (h > 0) return `${h}:${pad(m)}:${pad(s)}`
+    return `${m}:${pad(s)}`
+  }
+
+  async function loadTimecodeQuestions() {
+    timecodeLoading = true
+    try {
+      const payload = await apiRequest(
+        `/api/sessions/${encodeURIComponent(route.code)}/questions?sort=answered`,
+        { auth: true }
+      )
+      timecodeQuestions = (payload.questions ?? [])
+        .filter((q) => q.is_answered === 1 && q.answered_at)
+        .sort((a, b) => a.answered_at - b.answered_at)
+      timecodeQuestionsLoaded = true
+    } catch {
+      // silently ignore
+    } finally {
+      timecodeLoading = false
+    }
+  }
+
+  async function copyTimecodes() {
+    try {
+      await navigator.clipboard.writeText(timecodeText)
+      timecodeCopied = true
+      setTimeout(() => { timecodeCopied = false }, 2000)
+    } catch {
+      // clipboard unavailable
+    }
+  }
+
+  $: timecodeStreamStartUnix = Math.floor(
+    new Date(timecodeYear, timecodeMonth - 1, timecodeDay, timecodeHour, timecodeMinute, timecodeSecond).getTime() / 1000
+  )
+
+  $: timecodeText = timecodeQuestions.length === 0
+    ? ''
+    : timecodeQuestions
+        .map((q) => `${formatTimecode(q.answered_at - timecodeStreamStartUnix)} ${q.body}`)
+        .join('\n')
+
+  $: if (admin && sessionData?.is_active === 0 && !timecodeQuestionsLoaded) {
+    setTimecodeStartFromUnix(sessionData.created_at)
+    void loadTimecodeQuestions()
   }
 </script>
 
@@ -1018,6 +1150,45 @@
               New session
             </button>
           {/if}
+
+          <!-- Banned users section -->
+          <div style="border-top: 1px solid var(--color-border, #e0e0e0); margin-top: 16px; padding-top: 16px;">
+            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
+              <p class="text-sm" style="font-weight: 600; margin: 0;">Banned users</p>
+              <button type="button" class="btn btn-ghost btn-sm" on:click={toggleBannedUsers}>
+                {showBannedUsers ? 'Hide' : 'Details'}
+              </button>
+            </div>
+            {#if showBannedUsers}
+              {#if loadingBans}
+                <p class="text-sm text-secondary" style="margin-top: 8px;">Loading...</p>
+              {:else if bannedUsers.length === 0}
+                <p class="text-sm text-secondary" style="margin-top: 8px;">No banned users.</p>
+              {:else}
+                <div style="display: flex; flex-direction: column; gap: 6px; margin-top: 8px;">
+                  {#each bannedUsers as ban}
+                    <div style="padding: 10px 12px; background: var(--color-surface-2, #f5f5f5); border-radius: 8px;">
+                      <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                        <span style="font-weight: 600;">@{ban.nickname}</span>
+                        <button
+                          type="button"
+                          class="btn btn-secondary btn-sm"
+                          disabled={unbanningUserId === ban.user_id}
+                          on:click={() => unbanUser(ban.user_id)}
+                        >Unban</button>
+                      </div>
+                      {#if ban.question_body}
+                        <p class="text-sm text-secondary" style="margin: 4px 0 0; font-style: italic;">"{ban.question_body}"</p>
+                      {/if}
+                      <p class="text-sm text-secondary" style="margin: 2px 0 0;">
+                        {ban.session_name ? `in ${ban.session_name} · ` : ''}banned {formatTime(ban.banned_at)}
+                      </p>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+            {/if}
+          </div>
         {:else}
           <LoginPanel
             {apiBase}
@@ -1053,8 +1224,8 @@
             </div>
             <button type="button" class="btn btn-ghost btn-sm" on:click={logout}>Log out</button>
           {:else}
-            <button type="button" class="btn btn-secondary btn-sm" on:click={() => (showSessionLogin = !showSessionLogin)}>
-              {showSessionLogin ? 'Cancel' : 'Log in'}
+            <button type="button" class="btn btn-secondary btn-sm" on:click={() => (showSessionLogin = true)}>
+              Log in
             </button>
           {/if}
         </div>
@@ -1063,7 +1234,6 @@
 
     <div class="app-body">
       <div style="margin-bottom: 20px;">
-        <span class="label-tag">Session</span>
         <h1>{sessionData?.name || 'Session'}</h1>
         {#if sessionData?.description}
           <p class="text-sm text-secondary" style="margin-top: 4px;">{sessionData.description}</p>
@@ -1087,7 +1257,6 @@
             <p class="text-sm text-secondary">You own this session. Use moderation controls on each question.</p>
             <button type="button" class="btn btn-ghost btn-sm" on:click={openSessionSettings}>Settings</button>
           {:else if currentUser}
-            <p class="text-sm text-secondary">Ask questions and vote on others.</p>
           {:else}
             <p class="text-sm text-secondary">Log in to ask questions and vote.</p>
           {/if}
@@ -1097,6 +1266,12 @@
       {#if sessionData && sessionData.is_active === 0}
         <div class="msg msg-info" style="margin-bottom: 16px;">
           This session has ended. Questions are no longer accepted.
+        </div>
+      {/if}
+
+      {#if viewerIsBanned}
+        <div class="msg msg-error" style="margin-bottom: 16px;">
+          You are banned in this session and cannot ask questions or vote.
         </div>
       {/if}
 
@@ -1138,6 +1313,20 @@
                   style="width: 100%; box-sizing: border-box;"
                 />
               </div>
+              <div>
+                <label for="settings-threshold" class="text-sm" style="display: block; margin-bottom: 4px;">Hide questions below score</label>
+                <div style="display: flex; align-items: center; gap: 8px;">
+                  <input
+                    id="settings-threshold"
+                    type="number"
+                    min="1"
+                    max="1000"
+                    bind:value={settingsThreshold}
+                    style="width: 72px;"
+                  />
+                  <span class="text-sm text-secondary">Questions at −{settingsThreshold} or lower move to Downvoted tab</span>
+                </div>
+              </div>
               <div style="display: flex; gap: 8px; align-items: center;">
                 <button type="submit" class="btn btn-primary btn-sm" disabled={settingsBusy}>
                   {settingsBusy ? 'Saving...' : 'Save'}
@@ -1161,20 +1350,73 @@
                   />
                 </div>
               {/if}
+
             </div>
           </form>
         </div>
       {/if}
 
-      {#if !currentUser && showSessionLogin}
+      {#if admin && sessionData && sessionData.is_active === 0}
         <div class="card section-gap" style="margin-bottom: 16px;">
-          <LoginPanel
-            {apiBase}
-            title="Log in to interact"
-            subtitle="Continue with Google to ask questions and vote."
-            submitLabel="Continue with Google"
-            returnTo={`/s/${route.code}`}
-          />
+          <h3 style="margin: 0 0 12px;">YouTube timecodes</h3>
+          <div style="display: flex; flex-direction: column; gap: 10px;">
+            <div>
+              <p class="text-sm" style="margin: 0 0 6px;">Stream start time</p>
+              <div style="display: flex; align-items: center; gap: 4px; flex-wrap: wrap;">
+                <input type="number" min="1" max="31" bind:value={timecodeDay} style="width: 52px;" title="Day" />
+                <span class="text-secondary">-</span>
+                <input type="number" min="1" max="12" bind:value={timecodeMonth} style="width: 52px;" title="Month" />
+                <span class="text-secondary">-</span>
+                <input type="number" min="2000" max="2099" bind:value={timecodeYear} style="width: 76px;" title="Year" />
+                <span style="margin-left: 6px;"></span>
+                <input type="number" min="0" max="23" bind:value={timecodeHour} style="width: 52px;" title="Hour (0–23)" />
+                <span class="text-secondary">:</span>
+                <input type="number" min="0" max="59" bind:value={timecodeMinute} style="width: 52px;" title="Minute" />
+                <span class="text-secondary">:</span>
+                <input type="number" min="0" max="59" bind:value={timecodeSecond} style="width: 52px;" title="Second" />
+                <button type="button" class="btn btn-ghost btn-sm" style="margin-left: 6px;" on:click={() => setTimecodeStartFromUnix(sessionData.created_at)}>Reset</button>
+              </div>
+              <p class="text-sm text-secondary" style="margin: 4px 0 0;">DD - MM - YYYY &nbsp; HH : MM : SS</p>
+            </div>
+            {#if timecodeLoading}
+              <p class="text-sm text-secondary">Loading questions...</p>
+            {:else if timecodeText}
+              <div>
+                <label for="timecode-output" class="text-sm" style="display: block; margin-bottom: 4px;">Timecodes</label>
+                <textarea
+                  id="timecode-output"
+                  readonly
+                  rows={Math.min(Math.max(timecodeQuestions.length, 2), 12)}
+                  style="width: 100%; box-sizing: border-box; font-family: monospace; font-size: 13px; resize: vertical;"
+                  value={timecodeText}
+                ></textarea>
+              </div>
+              <div>
+                <button type="button" class="btn btn-secondary btn-sm" on:click={copyTimecodes}>
+                  {timecodeCopied ? 'Copied!' : 'Copy'}
+                </button>
+              </div>
+            {:else if timecodeQuestionsLoaded}
+              <p class="text-sm text-secondary">No answered questions.</p>
+            {/if}
+          </div>
+        </div>
+      {/if}
+
+      {#if !currentUser && showSessionLogin}
+        <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+        <div class="modal-backdrop" on:click={() => (showSessionLogin = false)}>
+          <div class="modal-card" on:click|stopPropagation role="dialog" aria-modal="true">
+            <button class="modal-close" type="button" aria-label="Close" on:click={() => (showSessionLogin = false)}>✕</button>
+            <LoginPanel
+              {apiBase}
+              title="Log in to interact"
+              subtitle="Continue with Google to ask questions and vote."
+              submitLabel="Continue with Google"
+              returnTo={`/s/${route.code}`}
+            />
+            <p class="text-sm text-secondary" style="margin-top: 12px;">Google login only requests your name — not your email address.</p>
+          </div>
         </div>
       {/if}
 
@@ -1234,6 +1476,12 @@
             class:active={sessionSort === 'answered'}
             on:click={() => changeSort('answered')}
           >Answered</button>
+          <button
+            type="button"
+            class="tab"
+            class:active={sessionSort === 'downvoted'}
+            on:click={() => changeSort('downvoted')}
+          >Downvoted</button>
         </div>
 
         <div class="toolbar-spacer"></div>
@@ -1389,6 +1637,45 @@
 </div>
 
 <style>
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 200;
+    padding: 16px;
+  }
+
+  .modal-card {
+    background: var(--bg-card, #fff);
+    border-radius: 12px;
+    padding: 28px 24px 24px;
+    width: 100%;
+    max-width: 360px;
+    position: relative;
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.25);
+  }
+
+  .modal-close {
+    position: absolute;
+    top: 10px;
+    right: 12px;
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 16px;
+    line-height: 1;
+    padding: 4px 6px;
+    color: var(--ink-secondary, #888);
+    border-radius: 4px;
+  }
+
+  .modal-close:hover {
+    background: var(--bg-hover, #f0f0f0);
+  }
+
   .q-card.new-highlight {
     animation: new-question-fade 3s ease-out forwards;
   }

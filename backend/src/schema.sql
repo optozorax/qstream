@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS stream_sessions (
     name TEXT,
     description TEXT,
     stream_link TEXT,
-    stopped_at INTEGER
+    stopped_at INTEGER,
+    downvote_threshold INTEGER NOT NULL DEFAULT 5
 );
 
 CREATE TABLE IF NOT EXISTS questions (
@@ -78,9 +79,10 @@ CREATE INDEX IF NOT EXISTS idx_votes_user_rate_limit
     ON votes(user_id, updated_at);
 
 CREATE TABLE IF NOT EXISTS bans (
-    session_id INTEGER NOT NULL REFERENCES stream_sessions(id) ON DELETE CASCADE,
+    owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    question_id INTEGER REFERENCES questions(id),
     reason TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-    PRIMARY KEY (session_id, user_id)
+    PRIMARY KEY (owner_user_id, user_id)
 );

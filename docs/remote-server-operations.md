@@ -112,3 +112,9 @@ Production deploy (binary + static bundle + service configs):
 ```bash
 ./scripts/deploy-production.sh <ssh_user@host>
 ```
+
+Production deploy with SQLite reset:
+
+```bash
+./scripts/deploy-production.sh --remove-database <ssh_user@host>
+```

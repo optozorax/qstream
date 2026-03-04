@@ -99,6 +99,12 @@ For weak VPS, deploy prebuilt artifacts (no Rust build / no node_modules on serv
 ./scripts/deploy-production.sh <ssh_user@prod_vps_host>
 ```
 
+To redeploy and wipe SQLite data before service restart:
+
+```bash
+./scripts/deploy-production.sh --remove-database <ssh_user@prod_vps_host>
+```
+
 By default, this script reads `.env.install` (fallback: `.env.install.local`, then `.env.local`).
 
 This script configures:

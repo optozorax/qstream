@@ -32,7 +32,56 @@ load_local_env() {
 
 load_local_env
 
-DEPLOY_SSH_TARGET="${1:-${DEPLOY_SSH_TARGET:-${SSH_TARGET:-}}}"
+usage() {
+  cat <<'USAGE'
+Usage: ./scripts/deploy-production.sh [options] [<ssh_user@prod_vps_host>]
+
+Options:
+  --remove-database   Remove SQLite database file on remote host before start
+  -h, --help          Show this help
+USAGE
+}
+
+REMOVE_DATABASE="${REMOVE_DATABASE:-0}"
+CLI_DEPLOY_SSH_TARGET=""
+
+parse_args() {
+  local positional=()
+  while (($#)); do
+    case "$1" in
+      --remove-database)
+        REMOVE_DATABASE=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --)
+        shift
+        while (($#)); do
+          positional+=("$1")
+          shift
+        done
+        ;;
+      -*)
+        die "Unknown option: $1 (use --help for usage)"
+        ;;
+      *)
+        positional+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if ((${#positional[@]} > 1)); then
+    die "Too many positional arguments (expected at most one: <ssh_user@prod_vps_host>)"
+  fi
+  if ((${#positional[@]} == 1)); then
+    CLI_DEPLOY_SSH_TARGET="${positional[0]}"
+  fi
+}
+DEPLOY_SSH_TARGET="${DEPLOY_SSH_TARGET:-${SSH_TARGET:-}}"
 DEPLOY_PUBLIC_HOST="${DEPLOY_PUBLIC_HOST:-${PUBLIC_HOST:-}}"
 DEPLOY_SSH_KEY_PATH="${DEPLOY_SSH_KEY_PATH:-${SSH_KEY_PATH:-}}"
 
@@ -65,6 +114,11 @@ die() {
   printf '[deploy] ERROR: %s\n' "$*" >&2
   exit 1
 }
+
+parse_args "$@"
+if [[ -n "${CLI_DEPLOY_SSH_TARGET}" ]]; then
+  DEPLOY_SSH_TARGET="${CLI_DEPLOY_SSH_TARGET}"
+fi
 
 cleanup() {
   if [[ -n "${SSH_KEY_TEMP}" && -f "${SSH_KEY_TEMP}" ]]; then
@@ -312,7 +366,7 @@ scp -i "${SSH_KEY_TEMP}" -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-ne
 log "Installing release on remote server..."
 ssh -i "${SSH_KEY_TEMP}" -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new \
   "${DEPLOY_SSH_TARGET}" \
-  "DEPLOY_REMOTE_DIR='${DEPLOY_REMOTE_DIR}' DEPLOY_SYSTEM_USER='${DEPLOY_SYSTEM_USER}' DEPLOY_PUBLIC_HOST='${DEPLOY_PUBLIC_HOST}' DEPLOY_BACKEND_PORT='${DEPLOY_BACKEND_PORT}' REMOTE_BUNDLE='${REMOTE_BUNDLE}' RELEASE_ID='${RELEASE_ID}' bash -s" <<'REMOTE_SCRIPT'
+  "DEPLOY_REMOTE_DIR='${DEPLOY_REMOTE_DIR}' DEPLOY_SYSTEM_USER='${DEPLOY_SYSTEM_USER}' DEPLOY_PUBLIC_HOST='${DEPLOY_PUBLIC_HOST}' DEPLOY_BACKEND_PORT='${DEPLOY_BACKEND_PORT}' DEPLOY_DATABASE_URL='${DEPLOY_DATABASE_URL}' REMOVE_DATABASE='${REMOVE_DATABASE}' REMOTE_BUNDLE='${REMOTE_BUNDLE}' RELEASE_ID='${RELEASE_ID}' bash -s" <<'REMOTE_SCRIPT'
 set -Eeuo pipefail
 
 if ! command -v sudo >/dev/null 2>&1; then
@@ -381,6 +435,47 @@ free_backend_port() {
   return 1
 }
 
+sqlite_db_path_from_url() {
+  local url="$1"
+  local without_query="${url%%\?*}"
+
+  case "${without_query}" in
+    sqlite:///*)
+      printf '%s\n' "${without_query#sqlite://}"
+      ;;
+    sqlite://*)
+      printf '%s\n' "${without_query#sqlite://}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+remove_database_if_requested() {
+  if [[ "${REMOVE_DATABASE}" != "1" ]]; then
+    return 0
+  fi
+
+  local db_path=""
+  db_path="$(sqlite_db_path_from_url "${DEPLOY_DATABASE_URL}" || true)"
+  if [[ -z "${db_path}" ]]; then
+    echo "[deploy-remote] --remove-database requires sqlite DATABASE_URL, got: ${DEPLOY_DATABASE_URL}" >&2
+    return 1
+  fi
+
+  case "${db_path}" in
+    /var/lib/qstream/*) ;;
+    *)
+      echo "[deploy-remote] refusing to remove database outside /var/lib/qstream: ${db_path}" >&2
+      return 1
+      ;;
+  esac
+
+  echo "[deploy-remote] removing database files: ${db_path}, ${db_path}-wal, ${db_path}-shm"
+  sudo rm -f "${db_path}" "${db_path}-wal" "${db_path}-shm"
+}
+
 REMOTE_RELEASE_DIR="${DEPLOY_REMOTE_DIR}/releases/${RELEASE_ID}"
 sudo mkdir -p "${DEPLOY_REMOTE_DIR}/releases" /etc/qstream /var/lib/qstream
 sudo rm -rf "${REMOTE_RELEASE_DIR}"
@@ -432,6 +527,7 @@ sudo systemctl restart systemd-journald
 sudo systemctl daemon-reload
 sudo systemctl stop qstream-backend || true
 free_backend_port "${DEPLOY_BACKEND_PORT}"
+remove_database_if_requested
 sudo systemctl enable qstream-backend
 sudo systemctl restart qstream-backend
 sudo systemctl enable caddy

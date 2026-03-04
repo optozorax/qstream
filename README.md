@@ -21,48 +21,82 @@ Use returned token in header (`auth_token` from URL fragment after OAuth callbac
 - `Authorization: Bearer <auth_token>`
 
 ### Sessions
+- `GET /api/sessions`
+  - auth required
+  - returns all sessions owned by the authenticated user
 - `POST /api/sessions`
   - auth required
-  - creates one stream session per user (or returns existing)
-  - returns: `{ session, created, public_url }`
+  - body: `{ name, description?, stream_link?, downvote_threshold? }`
+  - creates a new session (multiple sessions per user supported)
+  - returns: `{ session, public_url }`
 - `GET /api/sessions/:code/events`
   - public SSE endpoint for real-time session updates
+  - per-IP connection limit enforced
   - emits JSON events in `data:` with `kind`:
     - `question_created`
     - `question_changed`
     - `question_deleted`
     - `resync`
+- `DELETE /api/sessions/:code`
+  - auth required, owner only
+  - hard-deletes the session and all its questions
 
 ### Questions
-- `GET /api/sessions/:code/questions?sort=top|new|answered`
+- `GET /api/sessions/:code/questions?sort=top|new|answered|downvoted`
   - public endpoint
   - returns ordered question list with score and vote count
-  - `top/new` exclude answered questions
-  - `answer in progress` questions are pinned to top in `top/new`
-  - `answered` returns only answered questions
+  - `top/new` exclude answered questions and questions at or below the downvote threshold
+  - `answer in progress` questions are pinned to top in `top/new` regardless of score
+  - `answered` returns only answered questions, ordered by `answered_at DESC`
+  - `downvoted` returns questions at or below the session's downvote threshold (excludes in-progress)
+  - response includes `viewer_is_banned: bool` for the authenticated user
 - `POST /api/sessions/:code/questions`
   - auth required
   - body: `{ "text": "..." }`
   - max 300 chars
   - one question per minute per user per session
   - session owner cannot create questions
+  - banned users cannot create questions
 
 ### Votes
 - `POST /api/questions/:id/vote`
   - auth required
-  - body: `{ "value": -1 | 1 }`
-  - one vote per user per question (upsert)
-  - can change vote anytime
-  - voting is disabled for answered/in-progress questions
+  - body: `{ "value": -1 | 0 | 1 }` (0 removes the vote)
+  - one vote per user per question (upsert — can change or retract anytime)
+  - voting disabled for answered/in-progress questions
   - session owner cannot vote
+  - banned users cannot vote
+  - rate limit: 200 votes per minute per user
 
 ### Admin moderation
 - `POST /api/questions/:id/moderate`
   - auth required
   - only session owner can call it
-  - body: `{ "action": "answer" | "finish_answering" | "delete" }`
-  - `answer` sets `is_answering=1`
-  - `finish_answering` sets `is_answered=1` and moves question to answered tab
+  - body: `{ "action": "answer" | "finish_answering" | "reopen" | "reject" | "delete" | "ban" }`
+  - `answer` sets `is_answering=1`, records `answering_started_at`
+  - `finish_answering` sets `is_answered=1`, records `answered_at`
+  - `reopen` clears `is_answering` and `is_answered` (moves back to active queue)
+  - `reject` marks question as rejected
+  - `delete` hard-deletes the question
+  - `ban` bans the question's author (owner-scoped, cross-session), deletes all their questions in the session, records the triggering question
+
+### Sessions (extended)
+- `PUT /api/sessions/:code`
+  - auth required, owner only
+  - body: `{ name, description?, stream_link?, downvote_threshold? }`
+  - `downvote_threshold` (integer 1–1000, default 5): questions at or below `-threshold` move to the Downvoted tab
+- `POST /api/sessions/:code/stop`
+  - auth required, owner only
+  - ends the session; questions can no longer be submitted
+
+### Bans
+- `GET /api/bans`
+  - auth required
+  - returns all bans created by the authenticated user (across all their sessions)
+  - each entry includes: `user_id`, `nickname`, `banned_at`, `question_body` (the triggering question), `session_name`
+- `DELETE /api/bans/:user_id`
+  - auth required
+  - removes the ban; user can interact with the owner's sessions again
 
 ### Health
 - `GET /api/health`
@@ -91,13 +125,14 @@ Default env values:
 
 If `RESET_DB_ON_BOOT=true`, backend drops and recreates all tables at startup.
 
-## Schema changes in MVP
+## Schema changes
 
-For this MVP we do not maintain SQL migrations.  
-When schema changes are needed, reset the DB intentionally:
+The backend runs lightweight migrations at startup via `ALTER TABLE` and table-recreation steps (see `init_db` in `backend/src/main.rs`). This means existing databases are upgraded automatically without data loss for the supported migration paths.
+
+To start completely fresh:
 
 1. Set `RESET_DB_ON_BOOT=true`.
-2. Restart backend once (it will rebuild schema from `backend/src/schema.sql`).
+2. Restart backend once (it drops and recreates all tables from `backend/src/schema.sql`).
 3. Set `RESET_DB_ON_BOOT=false` again.
 
 ## Frontend setup
@@ -195,6 +230,12 @@ Use local build + artifact deploy:
 ./scripts/deploy-production.sh <ssh_user@prod_vps_host>
 ```
 
+To wipe SQLite data during deploy:
+
+```bash
+./scripts/deploy-production.sh --remove-database <ssh_user@prod_vps_host>
+```
+
 By default, deploy script reads `.env.install` (fallback: `.env.install.local`, then `.env.local`).
 
 What it does:
@@ -229,23 +270,41 @@ Server layout, operations, and debugging checklist:
 
 - `/` (main page):
   - login via `Continue with Google`
-  - create one session (`Create` button)
-  - open current session link
+  - list of all your sessions with Active/Stopped badges
+  - create a new session (`New session` button)
+  - delete stopped sessions (with confirmation)
+  - **Banned users** section (collapsed by default, loads on demand):
+    - shows all users banned across all your sessions
+    - each entry shows: nickname, the question that triggered the ban (in italics), session name, time of ban
+    - `Unban` button per entry; unbanned users can interact with your sessions again
 - `/s/:code` (public session page):
-  - public question list with real-time updates and sorting tabs (`top` / `new` / `answered`)
-  - answered questions are removed from `top/new` and shown only in `answered`
-  - `answer in progress` questions are pinned at the top in `top/new`
-  - update mode switch: `Manual` (via `Update now` button) or `Auto (live)`
-  - in `manual` mode, `Update now` shows pending new-question count from SSE notifications
-  - logged-in non-owner viewers can toggle `Hide interacted` to filter out questions they already voted on or asked
-  - default update mode: stream owner -> auto, non-logged guest -> auto, logged non-owner viewer -> manual
+  - public question list with real-time updates and sorting tabs (`Top` / `New` / `Answered` / `Downvoted`)
+  - answered questions are removed from `Top`/`New` and shown only in `Answered`
+  - questions at or below the session's downvote threshold move to `Downvoted` (everyone can still vote them back)
+  - `answer in progress` questions are pinned at the top in `Top`/`New` regardless of score
+  - update mode switch: `Manual` or `Auto`
+  - in `Manual` mode, `Refresh` button shows a badge with pending new-question count from SSE notifications
+  - logged-in non-owner viewers can toggle `Hide voted` to filter out questions they already voted on or asked
+  - default update mode: stream owner → auto, non-logged guest → auto, logged non-owner viewer → manual
   - `Log in` button opens `Continue with Google`
-  - after login (non-owner): can submit question and vote `Like/Dislike` (voting disabled for answered/in-progress)
-  - stream owner cannot vote
-  - stream owner cannot submit questions
-  - if logged in user is session owner: can `Answer`, `Finish answering`, or `Delete`
+  - after login (non-owner): can submit question and vote upvote/downvote (voting disabled for answered/in-progress)
+  - stream owner cannot vote or submit questions
+  - **banned users** see an error banner and cannot submit questions or vote
+  - session owner controls per question: `Answer`, `Done` (finish answering), `Undo` (reopen), `Reject`, `Delete` (with confirmation), `Ban` (with confirmation)
+  - **Session settings panel** (owner only, `Settings` button):
+    - edit name, description, stream link
+    - **Downvote threshold**: configurable score at which questions move to the Downvoted tab (default: 5, range: 1–1000)
+    - `Stop session` button with confirmation (ends session, no new questions accepted)
+  - **YouTube timecodes panel** (owner only, shown after session ends):
+    - displays all answered questions as YouTube chapter lines (`M:SS Question text` or `H:MM:SS Question text`)
+    - sorted by answer time ascending (chronological chapter order)
+    - stream start time input: `DD - MM - YYYY HH : MM : SS` (locale-independent European format)
+    - defaults to session creation time; adjust to match actual stream start
+    - timecodes update instantly as you change the start time
+    - `Reset` button restores start time to session creation time
+    - `Copy` button copies the timecode block to clipboard (shows `Copied!` for 2 seconds)
+    - paste directly into YouTube stream description for automatic chapters
 
 Local storage keys:
 - `qstream_auth_token`
 - `qstream_user`
-- `qstream_current_session_code`

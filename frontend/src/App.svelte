@@ -1,6 +1,7 @@
 <script>
   import { onDestroy, onMount } from 'svelte'
   import LoginPanel from './lib/LoginPanel.svelte'
+  import ConfirmButton from './lib/ConfirmButton.svelte'
 
   const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '0.0.0.0'])
 
@@ -25,7 +26,6 @@
 
       if (!pageIsLocal) {
         if (apiIsLocal || (sameHost && url.port === '3000')) {
-          // Production should use same-origin HTTPS behind Caddy, not raw :3000.
           url.protocol = window.location.protocol
           url.hostname = window.location.hostname
           url.port = ''
@@ -44,19 +44,39 @@
 
   const AUTH_TOKEN_KEY = 'qstream_auth_token'
   const USER_KEY = 'qstream_user'
-  const SESSION_CODE_KEY = 'qstream_current_session_code'
-  const OWN_SESSION_CODE_KEY = 'qstream_own_session_code'
   const INTERACTED_QUESTIONS_PREFIX = 'qstream_interacted_questions'
 
   let route = parseRoute(window.location.pathname)
   let authToken = localStorage.getItem(AUTH_TOKEN_KEY) ?? ''
   let currentUser = parseStoredUser(localStorage.getItem(USER_KEY))
-  let storedSessionCode = localStorage.getItem(SESSION_CODE_KEY) ?? ''
-  let ownSessionCode = localStorage.getItem(OWN_SESSION_CODE_KEY) ?? ''
 
   let homeMessage = ''
-  let creatingSession = false
+
+  // User's own sessions (home page list)
+  let userSessions = []
+  let loadingSessions = false
+
+  // Create session form
+  let showCreateForm = false
+  let createName = ''
+  let createDescription = ''
+  let createStreamLink = ''
+  let createBusy = false
+  let createStatus = ''
+
   let showSessionLogin = false
+
+  // Session settings panel (admin)
+  let showSessionSettings = false
+  let settingsName = ''
+  let settingsDescription = ''
+  let settingsStreamLink = ''
+  let settingsBusy = false
+  let settingsStatus = ''
+  let stoppingSession = false
+
+  // Home page: deleting a session
+  let deletingSessionCode = null
 
   let sessionSort = 'top'
   let sessionData = null
@@ -125,6 +145,9 @@
     pendingNewQuestions = 0
     hideInteracted = false
     interactedQuestionIds = new Set()
+    showSessionSettings = false
+    settingsStatus = ''
+    stoppingSession = false
   }
 
   $: if (route.name === 'session' && sessionData) {
@@ -151,24 +174,6 @@
       return JSON.parse(raw)
     } catch {
       return null
-    }
-  }
-
-  function setSessionCode(code) {
-    storedSessionCode = code
-    if (code) {
-      localStorage.setItem(SESSION_CODE_KEY, code)
-    } else {
-      localStorage.removeItem(SESSION_CODE_KEY)
-    }
-  }
-
-  function setOwnSessionCode(code) {
-    ownSessionCode = code
-    if (code) {
-      localStorage.setItem(OWN_SESSION_CODE_KEY, code)
-    } else {
-      localStorage.removeItem(OWN_SESSION_CODE_KEY)
     }
   }
 
@@ -257,11 +262,10 @@
   function logout() {
     authToken = ''
     currentUser = null
+    userSessions = []
     localVotes = {}
     interactedQuestionIds = new Set()
     hideInteracted = false
-    setSessionCode('')
-    setOwnSessionCode('')
     localStorage.removeItem(AUTH_TOKEN_KEY)
     localStorage.removeItem(USER_KEY)
   }
@@ -355,6 +359,19 @@
     }
   }
 
+  async function fetchUserSessions() {
+    if (!authToken) return
+    loadingSessions = true
+    try {
+      const payload = await apiRequest('/api/sessions', { auth: true })
+      userSessions = payload.sessions ?? []
+    } catch {
+      // silently ignore — sessions will just be empty
+    } finally {
+      loadingSessions = false
+    }
+  }
+
   async function processOauthCallbackAndValidate() {
     const hashParams = parseHashParams(window.location.hash)
     const tokenFromHash = hashParams.get('auth_token')
@@ -376,6 +393,7 @@
             loadInteractedQuestions(route.code)
           } else {
             homeMessage = 'Logged in successfully.'
+            void fetchUserSessions()
           }
         }
       } catch {
@@ -411,6 +429,7 @@
       if (user && typeof user === 'object') {
         currentUser = user
         localStorage.setItem(USER_KEY, JSON.stringify(currentUser))
+        void fetchUserSessions()
       }
     } catch (error) {
       if (!isUnauthorizedApiError(error)) {
@@ -425,32 +444,42 @@
     }
   }
 
-  async function createSession() {
+  async function createSession(event) {
+    event.preventDefault()
     if (!authToken) {
-      homeMessage = 'Login first to create a session.'
+      createStatus = 'Login first to create a session.'
       return
     }
 
-    creatingSession = true
-    homeMessage = ''
+    const name = createName.trim()
+    if (!name) {
+      createStatus = 'Name is required.'
+      return
+    }
+
+    createBusy = true
+    createStatus = ''
 
     try {
       const payload = await apiRequest('/api/sessions', {
         method: 'POST',
-        body: JSON.stringify({}),
+        body: JSON.stringify({
+          name,
+          description: createDescription.trim() || null,
+          stream_link: createStreamLink.trim() || null
+        }),
         auth: true
       })
 
-      setOwnSessionCode(payload.session.public_code)
-      setSessionCode(payload.session.public_code)
-      homeMessage = payload.created
-        ? 'Session created. Opening session page...'
-        : 'Session already exists. Opening session page...'
+      createName = ''
+      createDescription = ''
+      createStreamLink = ''
+      showCreateForm = false
       goto(`/s/${payload.session.public_code}`)
     } catch (error) {
-      homeMessage = error instanceof Error ? error.message : 'Failed to create session.'
+      createStatus = error instanceof Error ? error.message : 'Failed to create session.'
     } finally {
-      creatingSession = false
+      createBusy = false
     }
   }
 
@@ -458,7 +487,6 @@
     disconnectSessionEvents()
     clearAutoRefreshDebounce()
     activeSessionCode = code
-    setSessionCode(code)
     updateMode = 'manual'
     updateModeTouched = false
     pendingNewQuestions = 0
@@ -531,6 +559,11 @@
       return
     }
 
+    if (payload.kind === 'resync') {
+      void refreshQuestions(activeSessionCode)
+      return
+    }
+
     if (updateMode === 'auto') {
       scheduleAutoRefresh()
       return
@@ -566,7 +599,6 @@
       questions = payload.questions
       rememberCurrentUserAuthoredQuestions(code)
       sessionError = ''
-      setSessionCode(code)
       pendingNewQuestions = 0
     } catch (error) {
       sessionError = error instanceof Error ? error.message : 'Failed to load questions.'
@@ -681,16 +713,9 @@
 
   $: viewerCanInteract =
     !!currentUser &&
-    !(route.name === 'session' && ownSessionCode && route.code === ownSessionCode) &&
-    !(sessionData && currentUser.id === sessionData.owner_user_id)
-
-  function isAdmin() {
-    return admin
-  }
-
-  function canUseViewerInteractions() {
-    return viewerCanInteract
-  }
+    !!sessionData &&
+    sessionData.is_active === 1 &&
+    currentUser.id !== sessionData.owner_user_id
 
   async function moderateQuestion(questionId, action) {
     if (!authToken) {
@@ -716,6 +741,9 @@
       if (payload.deleted) {
         questionStatus = 'Question deleted.'
         await refreshQuestions()
+      } else if (payload.banned) {
+        questionStatus = 'User banned.'
+        await refreshQuestions()
       } else if (payload.question) {
         if (action === 'answer') {
           questionStatus = 'Question is now in progress.'
@@ -733,6 +761,79 @@
     } finally {
       moderateBusy.delete(questionId)
       moderateBusy = new Set(moderateBusy)
+    }
+  }
+
+  async function updateSessionSettings(event) {
+    event.preventDefault()
+    if (!authToken) return
+
+    const name = settingsName.trim()
+    if (!name) {
+      settingsStatus = 'Name is required.'
+      return
+    }
+
+    settingsBusy = true
+    settingsStatus = ''
+
+    try {
+      const payload = await apiRequest(`/api/sessions/${encodeURIComponent(route.code)}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          name,
+          description: settingsDescription.trim() || null,
+          stream_link: settingsStreamLink.trim() || null
+        }),
+        auth: true
+      })
+      sessionData = payload
+      settingsStatus = 'Settings saved.'
+      showSessionSettings = false
+    } catch (error) {
+      settingsStatus = error instanceof Error ? error.message : 'Failed to save settings.'
+    } finally {
+      settingsBusy = false
+    }
+  }
+
+  function openSessionSettings() {
+    settingsName = sessionData?.name ?? ''
+    settingsDescription = sessionData?.description ?? ''
+    settingsStreamLink = sessionData?.stream_link ?? ''
+    settingsStatus = ''
+    showSessionSettings = true
+  }
+
+  async function stopSession() {
+    stoppingSession = true
+    try {
+      const payload = await apiRequest(`/api/sessions/${encodeURIComponent(route.code)}/stop`, {
+        method: 'POST',
+        auth: true
+      })
+      sessionData = payload
+      showSessionSettings = false
+      showStopConfirm = false
+    } catch (error) {
+      settingsStatus = error instanceof Error ? error.message : 'Failed to stop session.'
+    } finally {
+      stoppingSession = false
+    }
+  }
+
+  async function deleteSession(code) {
+    deletingSessionCode = code
+    try {
+      await apiRequest(`/api/sessions/${encodeURIComponent(code)}`, {
+        method: 'DELETE',
+        auth: true
+      })
+      userSessions = userSessions.filter((s) => s.public_code !== code)
+    } catch (error) {
+      homeMessage = error instanceof Error ? error.message : 'Failed to delete session.'
+    } finally {
+      deletingSessionCode = null
     }
   }
 
@@ -774,17 +875,96 @@
             <button type="button" class="btn btn-ghost" on:click={logout}>Log out</button>
           </div>
 
-          <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-            <button type="button" class="btn btn-primary" on:click={createSession} disabled={creatingSession}>
-              {creatingSession ? 'Creating...' : 'Create session'}
-            </button>
+          <!-- Session list -->
+          {#if loadingSessions}
+            <p class="text-sm text-secondary" style="margin-bottom: 12px;">Loading sessions...</p>
+          {:else if userSessions.length > 0}
+            <div style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px;">
+              {#each userSessions as session}
+                <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; background: var(--color-surface-2, #f5f5f5); border-radius: 8px;">
+                  <div style="min-width: 0; flex: 1;">
+                    <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+                      <span style="font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{session.name}</span>
+                      {#if session.is_active === 1}
+                        <span class="badge badge-answering" style="font-size: 11px; padding: 1px 6px;">Active</span>
+                      {:else}
+                        <span class="badge badge-rejected" style="font-size: 11px; padding: 1px 6px;">Stopped</span>
+                      {/if}
+                    </div>
+                    {#if session.description}
+                      <div class="text-sm text-secondary" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{session.description}</div>
+                    {/if}
+                  </div>
+                  <div style="display: flex; gap: 6px; flex-shrink: 0;">
+                    <a class="btn btn-secondary btn-sm" href={`/s/${session.public_code}`}>Open</a>
+                    {#if session.is_active === 0}
+                      <ConfirmButton
+                        class="btn btn-danger btn-sm"
+                        label="Delete"
+                        confirmLabel="Confirm delete"
+                        disabled={deletingSessionCode === session.public_code}
+                        on:confirm={() => deleteSession(session.public_code)}
+                      />
+                    {/if}
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {/if}
 
-            {#if storedSessionCode}
-              <a class="btn btn-secondary" href={`/s/${storedSessionCode}`}>
-                Open session
-              </a>
-            {/if}
-          </div>
+          <!-- Create session -->
+          {#if showCreateForm}
+            <form on:submit={createSession} style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 8px;">
+              <div>
+                <label for="create-name" class="text-sm" style="display: block; margin-bottom: 4px;">Name <span style="color: var(--color-danger)">*</span></label>
+                <input
+                  id="create-name"
+                  type="text"
+                  maxlength="100"
+                  bind:value={createName}
+                  placeholder="My Stream Q&A"
+                  style="width: 100%; box-sizing: border-box;"
+                />
+              </div>
+              <div>
+                <label for="create-description" class="text-sm" style="display: block; margin-bottom: 4px;">Description</label>
+                <textarea
+                  id="create-description"
+                  maxlength="500"
+                  bind:value={createDescription}
+                  placeholder="Short description shown to viewers"
+                  rows="2"
+                  style="width: 100%; box-sizing: border-box;"
+                ></textarea>
+              </div>
+              <div>
+                <label for="create-stream-link" class="text-sm" style="display: block; margin-bottom: 4px;">Stream link</label>
+                <input
+                  id="create-stream-link"
+                  type="url"
+                  maxlength="500"
+                  bind:value={createStreamLink}
+                  placeholder="https://twitch.tv/yourname"
+                  style="width: 100%; box-sizing: border-box;"
+                />
+              </div>
+              <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                <button type="submit" class="btn btn-primary" disabled={createBusy}>
+                  {createBusy ? 'Creating...' : 'Create'}
+                </button>
+                <button type="button" class="btn btn-ghost" on:click={() => { showCreateForm = false; createStatus = '' }}>
+                  Cancel
+                </button>
+                {#if createStatus}
+                  <span class="text-sm" style="color: var(--color-danger);">{createStatus}</span>
+                {/if}
+              </div>
+            </form>
+          {:else}
+            <button type="button" class="btn btn-primary" on:click={() => { showCreateForm = true; createStatus = '' }}>
+              New session
+            </button>
+          {/if}
         {:else}
           <LoginPanel
             {apiBase}
@@ -831,15 +1011,98 @@
     <div class="app-body">
       <div style="margin-bottom: 20px;">
         <span class="label-tag">Session</span>
-        <h1>{route.code}</h1>
-        {#if admin}
-          <p class="text-sm text-secondary">You own this session. Use moderation controls on each question.</p>
-        {:else if currentUser}
-          <p class="text-sm text-secondary">Ask questions and vote on others.</p>
-        {:else}
-          <p class="text-sm text-secondary">Log in to ask questions and vote.</p>
+        <h1>{sessionData?.name || 'Session'}</h1>
+        {#if sessionData?.description}
+          <p class="text-sm text-secondary" style="margin-top: 4px;">{sessionData.description}</p>
         {/if}
+        {#if sessionData?.stream_link}
+          <p class="text-sm" style="margin-top: 4px;">
+            <a href={sessionData.stream_link} target="_blank" rel="noopener noreferrer">Watch stream</a>
+          </p>
+        {/if}
+        <div style="margin-top: 8px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+          {#if admin}
+            <p class="text-sm text-secondary">You own this session. Use moderation controls on each question.</p>
+            <button type="button" class="btn btn-ghost btn-sm" on:click={openSessionSettings}>Settings</button>
+          {:else if currentUser}
+            <p class="text-sm text-secondary">Ask questions and vote on others.</p>
+          {:else}
+            <p class="text-sm text-secondary">Log in to ask questions and vote.</p>
+          {/if}
+        </div>
       </div>
+
+      {#if sessionData && sessionData.is_active === 0}
+        <div class="msg msg-info" style="margin-bottom: 16px;">
+          This session has ended. Questions are no longer accepted.
+        </div>
+      {/if}
+
+      {#if admin && showSessionSettings}
+        <div class="card section-gap" style="margin-bottom: 16px;">
+          <h3 style="margin: 0 0 12px;">Session settings</h3>
+          <form on:submit={updateSessionSettings}>
+            <div style="display: flex; flex-direction: column; gap: 10px;">
+              <div>
+                <label for="settings-name" class="text-sm" style="display: block; margin-bottom: 4px;">Name <span style="color: var(--color-danger)">*</span></label>
+                <input
+                  id="settings-name"
+                  type="text"
+                  maxlength="100"
+                  bind:value={settingsName}
+                  placeholder="My Stream Q&A"
+                  style="width: 100%; box-sizing: border-box;"
+                />
+              </div>
+              <div>
+                <label for="settings-description" class="text-sm" style="display: block; margin-bottom: 4px;">Description</label>
+                <textarea
+                  id="settings-description"
+                  maxlength="500"
+                  bind:value={settingsDescription}
+                  placeholder="Short description shown to viewers"
+                  rows="2"
+                  style="width: 100%; box-sizing: border-box;"
+                ></textarea>
+              </div>
+              <div>
+                <label for="settings-stream-link" class="text-sm" style="display: block; margin-bottom: 4px;">Stream link</label>
+                <input
+                  id="settings-stream-link"
+                  type="url"
+                  maxlength="500"
+                  bind:value={settingsStreamLink}
+                  placeholder="https://twitch.tv/yourname"
+                  style="width: 100%; box-sizing: border-box;"
+                />
+              </div>
+              <div style="display: flex; gap: 8px; align-items: center;">
+                <button type="submit" class="btn btn-primary btn-sm" disabled={settingsBusy}>
+                  {settingsBusy ? 'Saving...' : 'Save'}
+                </button>
+                <button type="button" class="btn btn-ghost btn-sm" on:click={() => { showSessionSettings = false; showStopConfirm = false }}>
+                  Cancel
+                </button>
+                {#if settingsStatus}
+                  <span class="text-sm" style="color: var(--color-danger);">{settingsStatus}</span>
+                {/if}
+              </div>
+
+              {#if sessionData && sessionData.is_active === 1}
+                <div style="border-top: 1px solid var(--color-border, #e0e0e0); margin-top: 14px; padding-top: 14px;">
+                  <ConfirmButton
+                    class="btn btn-danger btn-sm"
+                    label="Stop session"
+                    confirmLabel="Confirm stop"
+                    disabled={stoppingSession}
+                    on:confirm={stopSession}
+                  />
+                </div>
+              {/if}
+            </div>
+          </form>
+        </div>
+      {/if}
 
       {#if !currentUser && showSessionLogin}
         <div class="card section-gap" style="margin-bottom: 16px;">
@@ -997,31 +1260,41 @@
               </div>
 
               {#if admin}
-                <div class="q-actions">
+                <div class="q-actions" style="display: flex; align-items: center; gap: 6px;">
                   {#if item.is_answered === 0}
                     <button
                       type="button"
                       class="btn btn-secondary btn-sm"
                       on:click={() => moderateQuestion(item.id, item.is_answering === 1 ? 'finish_answering' : 'answer')}
                       disabled={moderateBusy.has(item.id)}
-                    >
-                      {item.is_answering === 1 ? 'Done' : 'Answer'}
-                    </button>
+                    >{item.is_answering === 1 ? 'Done' : 'Answer'}</button>
                   {/if}
+
                   {#if item.is_answered === 0 && item.is_rejected === 0}
                     <button
                       type="button"
-                      class="btn btn-danger btn-sm"
+                      class="btn btn-secondary btn-sm"
                       on:click={() => moderateQuestion(item.id, 'reject')}
                       disabled={moderateBusy.has(item.id)}
                     >Reject</button>
                   {/if}
-                  <button
-                    type="button"
-                    class="btn btn-danger btn-sm"
-                    on:click={() => moderateQuestion(item.id, 'delete')}
-                    disabled={moderateBusy.has(item.id)}
-                  >Delete</button>
+
+                  <div style="margin-left: auto; display: flex; gap: 6px;">
+                    <ConfirmButton
+                      class="btn btn-danger btn-sm"
+                      label="Delete"
+                      confirmLabel="Confirm delete"
+                      disabled={moderateBusy.has(item.id)}
+                      on:confirm={() => moderateQuestion(item.id, 'delete')}
+                    />
+                    <ConfirmButton
+                      class="btn btn-danger btn-sm"
+                      label="Ban"
+                      confirmLabel="Confirm ban"
+                      disabled={moderateBusy.has(item.id)}
+                      on:confirm={() => moderateQuestion(item.id, 'ban')}
+                    />
+                  </div>
                 </div>
               {/if}
             </div>

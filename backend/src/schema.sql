@@ -31,10 +31,13 @@ CREATE INDEX IF NOT EXISTS idx_oauth_login_states_expires_at
 
 CREATE TABLE IF NOT EXISTS stream_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner_user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+    owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     public_code TEXT NOT NULL UNIQUE,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-    is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1))
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+    name TEXT,
+    description TEXT,
+    stream_link TEXT
 );
 
 CREATE TABLE IF NOT EXISTS questions (

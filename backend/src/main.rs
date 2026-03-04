@@ -6,7 +6,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Redirect,
     },
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use reqwest::Client;
@@ -191,6 +191,13 @@ struct GoogleOAuthCallbackQuery {
 }
 
 #[derive(Deserialize)]
+struct CreateSessionRequest {
+    name: String,
+    description: Option<String>,
+    stream_link: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct CreateQuestionRequest {
     text: String,
 }
@@ -220,6 +227,16 @@ struct StreamSession {
     public_code: String,
     created_at: i64,
     is_active: i64,
+    name: Option<String>,
+    description: Option<String>,
+    stream_link: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UpdateSessionRequest {
+    name: String,
+    description: Option<String>,
+    stream_link: Option<String>,
 }
 
 #[derive(Serialize, FromRow)]
@@ -247,13 +264,18 @@ struct AuthUser {
 struct QuestionAdminMeta {
     session_id: i64,
     owner_user_id: i64,
+    author_user_id: i64,
 }
 
 #[derive(Serialize)]
 struct CreateSessionResponse {
     session: StreamSession,
-    created: bool,
     public_url: String,
+}
+
+#[derive(Serialize)]
+struct ListUserSessionsResponse {
+    sessions: Vec<StreamSession>,
 }
 
 #[derive(Serialize)]
@@ -274,6 +296,7 @@ struct VoteResponse {
 struct ModerateQuestionResponse {
     question_id: i64,
     deleted: bool,
+    banned: bool,
     question: Option<QuestionView>,
 }
 
@@ -302,6 +325,7 @@ struct ListQuestionsQuery {
 struct QuestionVoteMeta {
     session_id: i64,
     owner_user_id: i64,
+    session_is_active: i64,
     is_answering: i64,
     is_answered: i64,
     is_rejected: i64,
@@ -426,7 +450,7 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("invalid FRONTEND_ORIGIN: {frontend_origin}"))?,
         )
     }
-    .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+    .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
     .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
     let app = Router::new()
@@ -434,7 +458,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/me", get(get_me))
         .route("/api/google_oauth2/start", get(google_oauth_start))
         .route("/api/google_oauth2", get(google_oauth_callback))
-        .route("/api/sessions", post(create_session))
+        .route("/api/sessions", get(list_user_sessions).post(create_session))
+        .route("/api/sessions/:code", put(update_session).delete(delete_session))
+        .route("/api/sessions/:code/stop", post(stop_session))
         .route("/api/sessions/:code/events", get(session_events_handler))
         .route(
             "/api/sessions/:code/questions",
@@ -479,6 +505,8 @@ async fn init_db(db: &SqlitePool, reset_db_on_boot: bool) -> anyhow::Result<()> 
         .await?;
 
     ensure_google_oauth_schema(db).await?;
+    ensure_session_metadata_schema(db).await?;
+    ensure_multi_session_schema(db).await?;
 
     Ok(())
 }
@@ -519,6 +547,95 @@ async fn ensure_google_oauth_schema(db: &SqlitePool) -> anyhow::Result<()> {
     .execute(db)
     .await?;
 
+    Ok(())
+}
+
+async fn ensure_session_metadata_schema(db: &SqlitePool) -> anyhow::Result<()> {
+    for (col, col_type) in &[("name", "TEXT"), ("description", "TEXT"), ("stream_link", "TEXT")] {
+        let has_col: Option<String> = sqlx::query_scalar(&format!(
+            "SELECT name FROM pragma_table_info('stream_sessions') WHERE name = '{col}' LIMIT 1;"
+        ))
+        .fetch_optional(db)
+        .await?;
+
+        if has_col.is_none() {
+            sqlx::query(&format!(
+                "ALTER TABLE stream_sessions ADD COLUMN {col} {col_type};"
+            ))
+            .execute(db)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_multi_session_schema(db: &SqlitePool) -> anyhow::Result<()> {
+    // Check whether owner_user_id still has a UNIQUE constraint (index with a single column).
+    let indexes: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT name, "unique" FROM pragma_index_list('stream_sessions') WHERE "unique" = 1;"#,
+    )
+    .fetch_all(db)
+    .await?;
+
+    let mut has_unique_owner = false;
+    for (idx_name, _) in &indexes {
+        let cols: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT name FROM pragma_index_info('{idx_name}');"
+        ))
+        .fetch_all(db)
+        .await?;
+        if cols == ["owner_user_id"] {
+            has_unique_owner = true;
+            break;
+        }
+    }
+
+    if !has_unique_owner {
+        return Ok(());
+    }
+
+    // Recreate the table without the UNIQUE constraint on owner_user_id.
+    // name/description/stream_link are guaranteed to exist by the preceding migration.
+    let mut conn = db.acquire().await?;
+    sqlx::query("PRAGMA foreign_keys = OFF;")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE stream_sessions_new (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            public_code TEXT NOT NULL UNIQUE,
+            created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+            is_active   INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+            name        TEXT,
+            description TEXT,
+            stream_link TEXT
+        );
+        "#,
+    )
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO stream_sessions_new
+            SELECT id, owner_user_id, public_code, created_at, is_active, name, description, stream_link
+            FROM stream_sessions;
+        "#,
+    )
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query("DROP TABLE stream_sessions;")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("ALTER TABLE stream_sessions_new RENAME TO stream_sessions;")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("PRAGMA foreign_keys = ON;")
+        .execute(&mut *conn)
+        .await?;
+
+    tracing::info!("migrated stream_sessions: removed unique constraint on owner_user_id");
     Ok(())
 }
 
@@ -724,86 +841,100 @@ async fn google_oauth_callback(
     ))
 }
 
-async fn create_session(
+async fn list_user_sessions(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<CreateSessionResponse>, AppError> {
+) -> Result<Json<ListUserSessionsResponse>, AppError> {
     let auth = require_auth_user(&state, &headers).await?;
 
-    if let Some(existing) = sqlx::query_as::<_, StreamSession>(
+    let sessions = sqlx::query_as::<_, StreamSession>(
         r#"
         SELECT
             id,
             owner_user_id,
             public_code,
             CAST(created_at AS INTEGER) AS created_at,
-            is_active
+            is_active,
+            name,
+            description,
+            stream_link
         FROM stream_sessions
         WHERE owner_user_id = ?1
-        LIMIT 1;
+        ORDER BY CAST(created_at AS INTEGER) DESC;
         "#,
     )
     .bind(auth.user_id)
-    .fetch_optional(&state.db)
+    .fetch_all(&state.db)
     .await
-    .map_err(|err| AppError::internal(format!("failed to query stream session: {err}")))?
-    {
-        tracing::info!(user_id = auth.user_id, code = %existing.public_code, "returning existing session");
-        return Ok(Json(CreateSessionResponse {
-            public_url: build_public_session_url(&state.public_base_url, &existing.public_code),
-            session: existing,
-            created: false,
-        }));
+    .map_err(|err| AppError::internal(format!("failed to list sessions: {err}")))?;
+
+    Ok(Json(ListUserSessionsResponse { sessions }))
+}
+
+async fn create_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateSessionRequest>,
+) -> Result<Json<CreateSessionResponse>, AppError> {
+    let auth = require_auth_user(&state, &headers).await?;
+
+    let name = payload.name.trim().to_string();
+    if name.is_empty() {
+        return Err(AppError::bad_request("name cannot be empty"));
+    }
+    if name.chars().count() > 100 {
+        return Err(AppError::bad_request("name cannot exceed 100 characters"));
     }
 
-    let mut inserted = None;
+    let description = payload.description.and_then(|d| {
+        let t = d.trim().to_string();
+        if t.is_empty() { None } else { Some(t) }
+    });
+    if let Some(ref d) = description {
+        if d.chars().count() > 500 {
+            return Err(AppError::bad_request("description cannot exceed 500 characters"));
+        }
+    }
+
+    let stream_link = payload.stream_link.and_then(|l| {
+        let t = l.trim().to_string();
+        if t.is_empty() { None } else { Some(t) }
+    });
+    if let Some(ref l) = stream_link {
+        if !l.starts_with("http://") && !l.starts_with("https://") {
+            return Err(AppError::bad_request(
+                "stream_link must start with http:// or https://",
+            ));
+        }
+        if l.len() > 500 {
+            return Err(AppError::bad_request("stream_link cannot exceed 500 characters"));
+        }
+    }
+
+    let mut inserted_id: Option<i64> = None;
     for _ in 0..8 {
         let public_code = generate_session_code();
         let res = sqlx::query(
             r#"
-            INSERT INTO stream_sessions (owner_user_id, public_code, created_at, is_active)
-            VALUES (?1, ?2, unixepoch(), 1);
+            INSERT INTO stream_sessions (owner_user_id, public_code, created_at, is_active, name, description, stream_link)
+            VALUES (?1, ?2, unixepoch(), 1, ?3, ?4, ?5);
             "#,
         )
         .bind(auth.user_id)
         .bind(&public_code)
+        .bind(&name)
+        .bind(&description)
+        .bind(&stream_link)
         .execute(&state.db)
         .await;
 
         match res {
-            Ok(_) => {
-                let session = sqlx::query_as::<_, StreamSession>(
-                    r#"
-                    SELECT
-                        id,
-                        owner_user_id,
-                        public_code,
-                        CAST(created_at AS INTEGER) AS created_at,
-                        is_active
-                    FROM stream_sessions
-                    WHERE owner_user_id = ?1
-                    LIMIT 1;
-                    "#,
-                )
-                .bind(auth.user_id)
-                .fetch_one(&state.db)
-                .await
-                .map_err(|err| {
-                    AppError::internal(format!("failed to fetch stream session: {err}"))
-                })?;
-                inserted = Some(session);
+            Ok(result) => {
+                inserted_id = Some(result.last_insert_rowid());
                 break;
             }
+            Err(err) if err.to_string().contains("stream_sessions.public_code") => continue,
             Err(err) => {
-                let err_text = err.to_string();
-                if err_text.contains("stream_sessions.public_code") {
-                    continue;
-                }
-                if err_text.contains("stream_sessions.owner_user_id") {
-                    return Err(AppError::bad_request(
-                        "only one session per user is allowed for now",
-                    ));
-                }
                 return Err(AppError::internal(format!(
                     "failed to create stream session: {err}"
                 )));
@@ -811,14 +942,33 @@ async fn create_session(
         }
     }
 
-    let session =
-        inserted.ok_or_else(|| AppError::internal("failed to generate unique session code"))?;
+    let row_id =
+        inserted_id.ok_or_else(|| AppError::internal("failed to generate unique session code"))?;
 
-    tracing::info!(user_id = auth.user_id, code = %session.public_code, "session created");
+    let session = sqlx::query_as::<_, StreamSession>(
+        r#"
+        SELECT
+            id,
+            owner_user_id,
+            public_code,
+            CAST(created_at AS INTEGER) AS created_at,
+            is_active,
+            name,
+            description,
+            stream_link
+        FROM stream_sessions
+        WHERE id = ?1;
+        "#,
+    )
+    .bind(row_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to fetch new session: {err}")))?;
+
+    tracing::info!(user_id = auth.user_id, code = %session.public_code, %name, "session created");
     Ok(Json(CreateSessionResponse {
         public_url: build_public_session_url(&state.public_base_url, &session.public_code),
         session,
-        created: true,
     }))
 }
 
@@ -955,6 +1105,10 @@ async fn create_question(
         return Err(AppError::forbidden("session owner cannot create questions"));
     }
 
+    if session.is_active == 0 {
+        return Err(AppError::forbidden("session is stopped"));
+    }
+
     if is_user_banned(&state.db, session.id, auth.user_id).await? {
         return Err(AppError::forbidden("you are banned in this session"));
     }
@@ -1036,7 +1190,8 @@ async fn vote_question(
 
     let question_meta = sqlx::query_as::<_, QuestionVoteMeta>(
         r#"
-        SELECT q.session_id, s.owner_user_id, q.is_answering, q.is_answered, q.is_rejected, q.is_deleted
+        SELECT q.session_id, s.owner_user_id, s.is_active AS session_is_active,
+               q.is_answering, q.is_answered, q.is_rejected, q.is_deleted
         FROM questions q
         JOIN stream_sessions s ON s.id = q.session_id
         WHERE q.id = ?1;
@@ -1052,6 +1207,10 @@ async fn vote_question(
         return Err(AppError::forbidden(
             "session owner cannot vote for questions",
         ));
+    }
+
+    if question_meta.session_is_active == 0 {
+        return Err(AppError::forbidden("session is stopped"));
     }
 
     if question_meta.is_answered == 1 || question_meta.is_answering == 1 {
@@ -1154,7 +1313,7 @@ async fn moderate_question(
 
     let meta = sqlx::query_as::<_, QuestionAdminMeta>(
         r#"
-        SELECT s.id AS session_id, s.owner_user_id
+        SELECT s.id AS session_id, s.owner_user_id, q.author_user_id
         FROM questions q
         JOIN stream_sessions s ON s.id = q.session_id
         WHERE q.id = ?1
@@ -1209,6 +1368,7 @@ async fn moderate_question(
             Ok(Json(ModerateQuestionResponse {
                 question_id,
                 deleted: false,
+                banned: false,
                 question: Some(question),
             }))
         }
@@ -1244,6 +1404,7 @@ async fn moderate_question(
             Ok(Json(ModerateQuestionResponse {
                 question_id,
                 deleted: false,
+                banned: false,
                 question: Some(question),
             }))
         }
@@ -1276,6 +1437,7 @@ async fn moderate_question(
             Ok(Json(ModerateQuestionResponse {
                 question_id,
                 deleted: false,
+                banned: false,
                 question: Some(question),
             }))
         }
@@ -1301,13 +1463,171 @@ async fn moderate_question(
             Ok(Json(ModerateQuestionResponse {
                 question_id,
                 deleted: true,
+                banned: false,
                 question: None,
             }))
         }
+        "ban" => {
+            if meta.author_user_id == auth.user_id {
+                return Err(AppError::bad_request("cannot ban yourself"));
+            }
+
+            sqlx::query(
+                r#"
+                INSERT INTO bans (session_id, user_id, created_at)
+                VALUES (?1, ?2, unixepoch())
+                ON CONFLICT(session_id, user_id) DO NOTHING;
+                "#,
+            )
+            .bind(meta.session_id)
+            .bind(meta.author_user_id)
+            .execute(&state.db)
+            .await
+            .map_err(|err| AppError::internal(format!("failed to ban user: {err}")))?;
+
+            let question = fetch_question_by_id(&state.db, question_id).await?;
+            tracing::info!(
+                question_id,
+                user_id = auth.user_id,
+                banned_user = meta.author_user_id,
+                "user banned"
+            );
+
+            Ok(Json(ModerateQuestionResponse {
+                question_id,
+                deleted: false,
+                banned: true,
+                question: Some(question),
+            }))
+        }
         _ => Err(AppError::bad_request(
-            "action must be one of: answer, finish_answering, reject, delete",
+            "action must be one of: answer, finish_answering, reject, delete, ban",
         )),
     }
+}
+
+async fn stop_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(code): Path<String>,
+) -> Result<Json<StreamSession>, AppError> {
+    let auth = require_auth_user(&state, &headers).await?;
+    let session = find_session_by_code(&state.db, &code).await?;
+
+    if session.owner_user_id != auth.user_id {
+        return Err(AppError::forbidden("only session owner can stop session"));
+    }
+
+    if session.is_active == 0 {
+        return Err(AppError::bad_request("session is already stopped"));
+    }
+
+    sqlx::query("UPDATE stream_sessions SET is_active = 0 WHERE id = ?1;")
+        .bind(session.id)
+        .execute(&state.db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to stop session: {err}")))?;
+
+    tracing::info!(session_id = session.id, code = %code, "session stopped");
+    state
+        .session_events
+        .publish(session.id, SessionEvent::resync())
+        .await;
+
+    let updated = find_session_by_code(&state.db, &code).await?;
+    Ok(Json(updated))
+}
+
+async fn delete_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(code): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let auth = require_auth_user(&state, &headers).await?;
+    let session = find_session_by_code(&state.db, &code).await?;
+
+    if session.owner_user_id != auth.user_id {
+        return Err(AppError::forbidden("only session owner can delete session"));
+    }
+
+    if session.is_active != 0 {
+        return Err(AppError::bad_request("stop the session before deleting it"));
+    }
+
+    sqlx::query("DELETE FROM stream_sessions WHERE id = ?1;")
+        .bind(session.id)
+        .execute(&state.db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to delete session: {err}")))?;
+
+    tracing::info!(session_id = session.id, code = %code, "session deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(code): Path<String>,
+    Json(payload): Json<UpdateSessionRequest>,
+) -> Result<Json<StreamSession>, AppError> {
+    let auth = require_auth_user(&state, &headers).await?;
+    let session = find_session_by_code(&state.db, &code).await?;
+
+    if session.owner_user_id != auth.user_id {
+        return Err(AppError::forbidden("only session owner can update session info"));
+    }
+
+    let name = payload.name.trim().to_string();
+    if name.is_empty() {
+        return Err(AppError::bad_request("name cannot be empty"));
+    }
+    if name.chars().count() > 100 {
+        return Err(AppError::bad_request("name cannot exceed 100 characters"));
+    }
+
+    let description = payload.description.map(|d| {
+        let t = d.trim().to_string();
+        if t.is_empty() { None } else { Some(t) }
+    }).flatten();
+
+    if let Some(ref d) = description {
+        if d.chars().count() > 500 {
+            return Err(AppError::bad_request("description cannot exceed 500 characters"));
+        }
+    }
+
+    let stream_link = payload.stream_link.map(|l| {
+        let t = l.trim().to_string();
+        if t.is_empty() { None } else { Some(t) }
+    }).flatten();
+
+    if let Some(ref l) = stream_link {
+        if !l.starts_with("http://") && !l.starts_with("https://") {
+            return Err(AppError::bad_request("stream_link must start with http:// or https://"));
+        }
+        if l.len() > 500 {
+            return Err(AppError::bad_request("stream_link cannot exceed 500 characters"));
+        }
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE stream_sessions
+        SET name = ?1, description = ?2, stream_link = ?3
+        WHERE id = ?4;
+        "#,
+    )
+    .bind(&name)
+    .bind(&description)
+    .bind(&stream_link)
+    .bind(session.id)
+    .execute(&state.db)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to update session: {err}")))?;
+
+    tracing::info!(session_id = session.id, %name, "session metadata updated");
+    let updated = find_session_by_code(&state.db, &code).await?;
+    Ok(Json(updated))
 }
 
 async fn require_auth_user(state: &AppState, headers: &HeaderMap) -> Result<AuthUser, AppError> {
@@ -1354,9 +1674,12 @@ async fn find_session_by_code(db: &SqlitePool, code: &str) -> Result<StreamSessi
             owner_user_id,
             public_code,
             CAST(created_at AS INTEGER) AS created_at,
-            is_active
+            is_active,
+            name,
+            description,
+            stream_link
         FROM stream_sessions
-        WHERE public_code = ?1 AND is_active = 1
+        WHERE public_code = ?1
         LIMIT 1;
         "#,
     )

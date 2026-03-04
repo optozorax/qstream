@@ -230,6 +230,7 @@ struct StreamSession {
     name: Option<String>,
     description: Option<String>,
     stream_link: Option<String>,
+    stopped_at: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -254,6 +255,8 @@ struct QuestionView {
     score: i64,
     votes_count: i64,
     user_vote: i64,
+    answering_started_at: Option<i64>,
+    answered_at: Option<i64>,
 }
 
 #[derive(FromRow)]
@@ -284,6 +287,7 @@ struct ListQuestionsResponse {
     session: StreamSession,
     sort: String,
     questions: Vec<QuestionView>,
+    question_cooldown_remaining: i64,
 }
 
 #[derive(Serialize)]
@@ -508,6 +512,7 @@ async fn init_db(db: &SqlitePool, reset_db_on_boot: bool) -> anyhow::Result<()> 
     ensure_google_oauth_schema(db).await?;
     ensure_session_metadata_schema(db).await?;
     ensure_multi_session_schema(db).await?;
+    ensure_timestamps_schema(db).await?;
 
     Ok(())
 }
@@ -565,6 +570,27 @@ async fn ensure_session_metadata_schema(db: &SqlitePool) -> anyhow::Result<()> {
             ))
             .execute(db)
             .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_timestamps_schema(db: &SqlitePool) -> anyhow::Result<()> {
+    for (table, col) in &[
+        ("stream_sessions", "stopped_at"),
+        ("questions", "answering_started_at"),
+        ("questions", "answered_at"),
+    ] {
+        let has_col: Option<String> = sqlx::query_scalar(&format!(
+            "SELECT name FROM pragma_table_info('{table}') WHERE name = '{col}' LIMIT 1;"
+        ))
+        .fetch_optional(db)
+        .await?;
+
+        if has_col.is_none() {
+            sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {col} INTEGER;"))
+                .execute(db)
+                .await?;
         }
     }
     Ok(())
@@ -858,7 +884,8 @@ async fn list_user_sessions(
             is_active,
             name,
             description,
-            stream_link
+            stream_link,
+            stopped_at
         FROM stream_sessions
         WHERE owner_user_id = ?1
         ORDER BY CAST(created_at AS INTEGER) DESC;
@@ -956,7 +983,8 @@ async fn create_session(
             is_active,
             name,
             description,
-            stream_link
+            stream_link,
+            stopped_at
         FROM stream_sessions
         WHERE id = ?1;
         "#,
@@ -988,10 +1016,32 @@ async fn list_questions(
 
     let questions = list_questions_for_session(&state.db, session.id, sort, viewer_user_id).await?;
 
+    let question_cooldown_remaining = if let Some(uid) = viewer_user_id {
+        let last_at: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT CAST(created_at AS INTEGER)
+            FROM questions
+            WHERE session_id = ?1 AND author_user_id = ?2
+            ORDER BY CAST(created_at AS INTEGER) DESC
+            LIMIT 1;
+            "#,
+        )
+        .bind(session.id)
+        .bind(uid)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
+
+        last_at.map(|t| (t + 60 - now_unix()).max(0)).unwrap_or(0)
+    } else {
+        0
+    };
+
     Ok(Json(ListQuestionsResponse {
         session,
         sort: sort.as_str().to_string(),
         questions,
+        question_cooldown_remaining,
     }))
 }
 
@@ -1394,7 +1444,7 @@ async fn moderate_question(
             let update = sqlx::query(
                 r#"
                 UPDATE questions
-                SET is_answering = 1
+                SET is_answering = 1, answering_started_at = unixepoch()
                 WHERE id = ?1 AND is_answered = 0;
                 "#,
             )
@@ -1434,7 +1484,8 @@ async fn moderate_question(
                 r#"
                 UPDATE questions
                 SET is_answered = 1,
-                    is_answering = 0
+                    is_answering = 0,
+                    answered_at = unixepoch()
                 WHERE id = ?1 AND is_answering = 1 AND is_answered = 0;
                 "#,
             )
@@ -1557,8 +1608,44 @@ async fn moderate_question(
                 question: Some(question),
             }))
         }
+        "reopen" => {
+            let update = sqlx::query(
+                r#"
+                UPDATE questions
+                SET is_answering = 0,
+                    is_answered = 0,
+                    answering_started_at = NULL,
+                    answered_at = NULL
+                WHERE id = ?1 AND (is_answering = 1 OR is_answered = 1);
+                "#,
+            )
+            .bind(question_id)
+            .execute(&state.db)
+            .await
+            .map_err(|err| AppError::internal(format!("failed to reopen question: {err}")))?;
+
+            if update.rows_affected() == 0 {
+                return Err(AppError::bad_request(
+                    "question is not in answering or answered state",
+                ));
+            }
+
+            let question = fetch_question_by_id(&state.db, question_id).await?;
+            tracing::info!(question_id, user_id = auth.user_id, "question reopened");
+            state
+                .session_events
+                .publish(meta.session_id, SessionEvent::question_changed(question_id))
+                .await;
+
+            Ok(Json(ModerateQuestionResponse {
+                question_id,
+                deleted: false,
+                banned: false,
+                question: Some(question),
+            }))
+        }
         _ => Err(AppError::bad_request(
-            "action must be one of: answer, finish_answering, reject, delete, ban",
+            "action must be one of: answer, finish_answering, reject, reopen, delete, ban",
         )),
     }
 }
@@ -1579,7 +1666,7 @@ async fn stop_session(
         return Err(AppError::bad_request("session is already stopped"));
     }
 
-    sqlx::query("UPDATE stream_sessions SET is_active = 0 WHERE id = ?1;")
+    sqlx::query("UPDATE stream_sessions SET is_active = 0, stopped_at = unixepoch() WHERE id = ?1;")
         .bind(session.id)
         .execute(&state.db)
         .await
@@ -1754,7 +1841,8 @@ async fn find_session_by_code(db: &SqlitePool, code: &str) -> Result<StreamSessi
             is_active,
             name,
             description,
-            stream_link
+            stream_link,
+            stopped_at
         FROM stream_sessions
         WHERE public_code = ?1
         LIMIT 1;
@@ -1803,7 +1891,9 @@ async fn list_questions_for_session(
             CAST(q.created_at AS INTEGER) AS created_at,
             COALESCE(SUM(v.value), 0) AS score,
             COALESCE(COUNT(v.user_id), 0) AS votes_count,
-            COALESCE(MAX(uv.value), 0) AS user_vote
+            COALESCE(MAX(uv.value), 0) AS user_vote,
+            CAST(q.answering_started_at AS INTEGER) AS answering_started_at,
+            CAST(q.answered_at AS INTEGER) AS answered_at
         FROM questions q
         JOIN users u ON u.id = q.author_user_id
         LEFT JOIN votes v ON v.question_id = q.id
@@ -1838,7 +1928,9 @@ async fn fetch_question_by_id(db: &SqlitePool, question_id: i64) -> Result<Quest
             CAST(q.created_at AS INTEGER) AS created_at,
             COALESCE(SUM(v.value), 0) AS score,
             COALESCE(COUNT(v.user_id), 0) AS votes_count,
-            0 AS user_vote
+            0 AS user_vote,
+            CAST(q.answering_started_at AS INTEGER) AS answering_started_at,
+            CAST(q.answered_at AS INTEGER) AS answered_at
         FROM questions q
         JOIN users u ON u.id = q.author_user_id
         LEFT JOIN votes v ON v.question_id = q.id

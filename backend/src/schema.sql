@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS stream_sessions (
     is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
     name TEXT,
     description TEXT,
-    stream_link TEXT
+    stream_link TEXT,
+    stopped_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS questions (
@@ -49,7 +50,9 @@ CREATE TABLE IF NOT EXISTS questions (
     is_answered INTEGER NOT NULL DEFAULT 0 CHECK (is_answered IN (0, 1)),
     is_rejected INTEGER NOT NULL DEFAULT 0 CHECK (is_rejected IN (0, 1)),
     is_deleted INTEGER NOT NULL DEFAULT 0 CHECK (is_deleted IN (0, 1)),
-    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    answering_started_at INTEGER,
+    answered_at INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_questions_new

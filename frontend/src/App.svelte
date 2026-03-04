@@ -87,6 +87,28 @@
   let questionText = ''
   let questionStatus = ''
   let questionBusy = false
+  let newQuestionId = null
+  let newQuestionTimer = null
+  let questionCooldownUntil = 0
+  let questionCooldownRemaining = 0
+  let questionCooldownTimer = null
+
+  function startQuestionCooldown(seconds = 60) {
+    if (seconds <= 0) return
+    questionCooldownUntil = nowUnix() + seconds
+    questionCooldownRemaining = seconds
+    if (questionCooldownTimer !== null) clearInterval(questionCooldownTimer)
+    questionCooldownTimer = setInterval(() => {
+      const remaining = questionCooldownUntil - nowUnix()
+      if (remaining <= 0) {
+        questionCooldownRemaining = 0
+        clearInterval(questionCooldownTimer)
+        questionCooldownTimer = null
+      } else {
+        questionCooldownRemaining = remaining
+      }
+    }, 500)
+  }
   let voteBusy = new Set()
   let moderateBusy = new Set()
   let localVotes = {}
@@ -125,6 +147,8 @@
   onDestroy(() => {
     disconnectSessionEvents()
     clearAutoRefreshDebounce()
+    if (questionCooldownTimer !== null) clearInterval(questionCooldownTimer)
+    if (newQuestionTimer !== null) clearTimeout(newQuestionTimer)
   })
 
   $: if (route.name === 'session') {
@@ -148,6 +172,8 @@
     showSessionSettings = false
     settingsStatus = ''
     stoppingSession = false
+    newQuestionId = null
+    if (newQuestionTimer !== null) { clearTimeout(newQuestionTimer); newQuestionTimer = null }
   }
 
   $: if (route.name === 'session' && sessionData) {
@@ -603,6 +629,9 @@
         if (q.user_vote !== 0) serverVotes[q.id] = q.user_vote
       }
       localVotes = serverVotes
+      if (payload.question_cooldown_remaining > 0 && questionCooldownRemaining === 0) {
+        startQuestionCooldown(payload.question_cooldown_remaining)
+      }
       rememberCurrentUserAuthoredQuestions(code)
       sessionError = ''
       pendingNewQuestions = 0
@@ -668,8 +697,11 @@
       addInteractedQuestion(payload?.id)
 
       questionText = ''
-      questionStatus = 'Question added.'
+      if (newQuestionTimer !== null) clearTimeout(newQuestionTimer)
+      newQuestionId = payload?.id ?? null
+      startQuestionCooldown()
       await refreshQuestions()
+      newQuestionTimer = setTimeout(() => { newQuestionId = null; newQuestionTimer = null }, 3000)
     } catch (error) {
       questionStatus = error instanceof Error ? error.message : 'Failed to add question.'
     } finally {
@@ -757,6 +789,8 @@
           questionStatus = 'Question moved to answered.'
         } else if (action === 'reject') {
           questionStatus = 'Question rejected.'
+        } else if (action === 'reopen') {
+          questionStatus = 'Question reopened.'
         } else {
           questionStatus = 'Question updated.'
         }
@@ -858,6 +892,19 @@
 
   function userInitial(nickname) {
     return (nickname || '?')[0].toUpperCase()
+  }
+
+  function nowUnix() {
+    return Math.floor(Date.now() / 1000)
+  }
+
+  function formatDuration(seconds) {
+    if (seconds < 60) return `${seconds}s`
+    const min = Math.floor(seconds / 60)
+    if (min < 60) return `${min}m`
+    const hr = Math.floor(min / 60)
+    const remMin = min % 60
+    return remMin > 0 ? `${hr}h ${remMin}m` : `${hr}h`
   }
 </script>
 
@@ -1026,6 +1073,15 @@
             <a href={sessionData.stream_link} target="_blank" rel="noopener noreferrer">Watch stream</a>
           </p>
         {/if}
+        {#if sessionData}
+          <p class="text-sm text-secondary" style="margin-top: 4px;">
+            {#if sessionData.is_active === 1}
+              Active for {formatDuration(nowUnix() - sessionData.created_at)}
+            {:else if sessionData.stopped_at}
+              Was active for {formatDuration(sessionData.stopped_at - sessionData.created_at)}
+            {/if}
+          </p>
+        {/if}
         <div style="margin-top: 8px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
           {#if admin}
             <p class="text-sm text-secondary">You own this session. Use moderation controls on each question.</p>
@@ -1132,8 +1188,17 @@
             ></textarea>
             <div class="q-form-footer">
               <span class="char-count">{questionText.trim().length} / 300</span>
-              <button type="submit" class="btn btn-primary btn-sm" disabled={questionBusy}>
-                {questionBusy ? 'Sending...' : 'Ask'}
+              <button type="submit" class="btn btn-primary btn-sm" disabled={questionBusy || questionCooldownRemaining > 0}>
+                {#if questionBusy}
+                  Sending...
+                {:else if questionCooldownRemaining > 0}
+                  <svg class="ask-cooldown" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+                    <circle class="ask-cooldown-track" cx="6" cy="6" r="4.5" />
+                    <circle style="stroke-dashoffset: {28.27 * (1 - questionCooldownRemaining / 60)}; transition: stroke-dashoffset 0.5s linear;" cx="6" cy="6" r="4.5" />
+                  </svg><span style="font-variant-numeric: tabular-nums;">{questionCooldownRemaining}s</span>
+                {:else}
+                  Ask
+                {/if}
               </button>
             </div>
           </form>
@@ -1219,7 +1284,7 @@
         {/if}
 
         {#each visibleQuestions as item}
-          <article class="q-card" class:answering={item.is_answering === 1} class:answered={item.is_answered === 1} class:rejected={item.is_rejected === 1}>
+          <article class="q-card" class:answering={item.is_answering === 1} class:answered={item.is_answered === 1} class:rejected={item.is_rejected === 1} class:new-highlight={item.id === newQuestionId}>
             <div class="q-vote-col">
               <button
                 type="button"
@@ -1259,6 +1324,13 @@
                 <span>{formatTime(item.created_at)}</span>
                 <span class="q-meta-sep">&middot;</span>
                 <span>{item.votes_count} vote{item.votes_count === 1 ? '' : 's'}</span>
+                {#if item.is_answering === 1 && item.answering_started_at}
+                  <span class="q-meta-sep">&middot;</span>
+                  <span>answering for {formatDuration(nowUnix() - item.answering_started_at)}</span>
+                {:else if item.is_answered === 1 && item.answered_at && item.answering_started_at}
+                  <span class="q-meta-sep">&middot;</span>
+                  <span>answered in {formatDuration(item.answered_at - item.answering_started_at)}</span>
+                {/if}
               </div>
 
               {#if admin}
@@ -1270,6 +1342,15 @@
                       on:click={() => moderateQuestion(item.id, item.is_answering === 1 ? 'finish_answering' : 'answer')}
                       disabled={moderateBusy.has(item.id)}
                     >{item.is_answering === 1 ? 'Done' : 'Answer'}</button>
+                  {/if}
+
+                  {#if item.is_answering === 1 || item.is_answered === 1}
+                    <button
+                      type="button"
+                      class="btn btn-secondary btn-sm"
+                      on:click={() => moderateQuestion(item.id, 'reopen')}
+                      disabled={moderateBusy.has(item.id)}
+                    >Undo</button>
                   {/if}
 
                   {#if item.is_answered === 0 && item.is_rejected === 0}
@@ -1306,3 +1387,37 @@
     </div>
   {/if}
 </div>
+
+<style>
+  .q-card.new-highlight {
+    animation: new-question-fade 3s ease-out forwards;
+  }
+
+  @keyframes new-question-fade {
+    from { box-shadow: 0 0 0 2px rgba(5, 150, 105, 0.8), 0 0 16px rgba(5, 150, 105, 0.3); }
+    to   { box-shadow: 0 0 0 2px rgba(5, 150, 105, 0),   0 0 16px rgba(5, 150, 105, 0); }
+  }
+
+  .ask-cooldown {
+    display: inline-block;
+    margin-right: 4px;
+    vertical-align: -2px;
+    flex-shrink: 0;
+  }
+
+  .ask-cooldown circle {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+  }
+
+  .ask-cooldown-track {
+    opacity: 0.35;
+  }
+
+  .ask-cooldown circle:not(.ask-cooldown-track) {
+    stroke-dasharray: 28.27;
+    transform: scale(-1, 1) rotate(-90deg);
+    transform-origin: 6px 6px;
+  }
+</style>

@@ -3,8 +3,7 @@ CREATE TABLE IF NOT EXISTS users (
     nickname TEXT NOT NULL,
     google_sub TEXT UNIQUE,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-    last_login_at INTEGER NOT NULL DEFAULT (unixepoch()),
-    last_hcaptcha_at INTEGER NOT NULL DEFAULT (unixepoch())
+    last_login_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
 CREATE TABLE IF NOT EXISTS auth_sessions (

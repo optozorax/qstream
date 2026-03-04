@@ -890,31 +890,27 @@ async fn list_questions(
 
     let questions = list_questions_for_session(&state.db, session.id, sort, viewer_user_id, session.downvote_threshold).await?;
 
-    let question_cooldown_remaining = if let Some(uid) = viewer_user_id {
-        let last_at: Option<i64> = sqlx::query_scalar(
+    let (question_cooldown_remaining, viewer_is_banned) = if let Some(uid) = viewer_user_id {
+        let row: (Option<i64>, i64) = sqlx::query_as(
             r#"
-            SELECT CAST(created_at AS INTEGER)
-            FROM questions
-            WHERE session_id = ?1 AND author_user_id = ?2
-            ORDER BY CAST(created_at AS INTEGER) DESC
-            LIMIT 1;
+            SELECT
+                (SELECT CAST(created_at AS INTEGER) FROM questions
+                 WHERE session_id = ?1 AND author_user_id = ?2
+                 ORDER BY CAST(created_at AS INTEGER) DESC LIMIT 1),
+                EXISTS(SELECT 1 FROM bans WHERE owner_user_id = ?3 AND user_id = ?2)
             "#,
         )
         .bind(session.id)
         .bind(uid)
-        .fetch_optional(&state.db)
+        .bind(session.owner_user_id)
+        .fetch_one(&state.db)
         .await
-        .unwrap_or(None);
+        .unwrap_or((None, 0));
 
-        last_at.map(|t| (t + 60 - now_unix()).max(0)).unwrap_or(0)
+        let cooldown = row.0.map(|t| (t + 60 - now_unix()).max(0)).unwrap_or(0);
+        (cooldown, row.1 != 0)
     } else {
-        0
-    };
-
-    let viewer_is_banned = if let Some(uid) = viewer_user_id {
-        is_user_banned(&state.db, session.owner_user_id, uid).await.unwrap_or(false)
-    } else {
-        false
+        (0, false)
     };
 
     Ok(Json(ListQuestionsResponse {
@@ -1816,7 +1812,7 @@ async fn list_questions_for_session(
         QuestionSort::Answered => (
             "WHERE q.session_id = ?1 AND (q.is_answered = 1 OR q.is_rejected = 1) AND q.is_deleted = 0",
             String::new(),
-            "ORDER BY CAST(q.created_at AS INTEGER) DESC",
+            "ORDER BY COALESCE(CAST(q.answered_at AS INTEGER), CAST(q.created_at AS INTEGER)) DESC",
         ),
         QuestionSort::New => (
             "WHERE q.session_id = ?1 AND q.is_answered = 0 AND q.is_rejected = 0 AND q.is_deleted = 0",

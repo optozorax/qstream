@@ -994,13 +994,14 @@ async fn list_questions(
 
 async fn session_events_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(code): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     let session = find_session_by_code(&state.db, &code).await?;
 
     // Per-IP SSE connection limit
-    let ip = addr.ip();
+    let ip = resolve_request_ip(&headers, addr);
     {
         let mut conns = state.sse_connections.lock().await;
         let count = conns.entry(ip).or_insert(0);
@@ -1019,7 +1020,7 @@ async fn session_events_handler(
     // Clone for the drop guard
     let sse_connections = state.sse_connections.clone();
 
-    let stream = BroadcastStream::new(receiver).filter_map(|message| {
+    let live_stream = BroadcastStream::new(receiver).filter_map(|message| {
         let event = match message {
             Ok(event) => event,
             Err(err) => {
@@ -1037,6 +1038,14 @@ async fn session_events_handler(
         }
     });
 
+    // Emit one event immediately so clients can transition to "live" without
+    // waiting for the first keepalive tick or a new question event.
+    let initial_stream = tokio_stream::iter([Ok(Event::default().data(
+        serde_json::to_string(&SessionEvent::resync())
+            .unwrap_or_else(|_| r#"{"kind":"resync","question_id":null}"#.to_string()),
+    ))]);
+    let stream = initial_stream.chain(live_stream);
+
     // Wrap stream to decrement connection count on drop
     let stream = SseDropGuard {
         inner: Box::pin(stream),
@@ -1050,6 +1059,40 @@ async fn session_events_handler(
             .interval(Duration::from_secs(15))
             .text("keepalive"),
     ))
+}
+
+fn resolve_request_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
+    if !addr.ip().is_loopback() {
+        return addr.ip();
+    }
+
+    if let Some(ip) = parse_ip_header(headers.get("cf-connecting-ip")) {
+        return ip;
+    }
+
+    if let Some(ip) = parse_ip_header(headers.get("x-real-ip")) {
+        return ip;
+    }
+
+    if let Some(value) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(ip) = value
+            .split(',')
+            .map(|part| part.trim())
+            .filter(|part| !part.is_empty())
+            .next_back()
+            .and_then(|part| part.parse::<IpAddr>().ok())
+        {
+            return ip;
+        }
+    }
+
+    addr.ip()
+}
+
+fn parse_ip_header(value: Option<&HeaderValue>) -> Option<IpAddr> {
+    value
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<IpAddr>().ok())
 }
 
 /// A stream wrapper that decrements the SSE connection count when dropped.

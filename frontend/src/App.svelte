@@ -496,8 +496,8 @@
     localVotes = {}
     hideInteracted = false
     loadInteractedQuestions(code, false)
-    await refreshQuestions(code)
     connectSessionEvents(code)
+    await refreshQuestions(code)
   }
 
   function clearAutoRefreshDebounce() {

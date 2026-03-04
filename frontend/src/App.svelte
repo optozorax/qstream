@@ -1589,31 +1589,33 @@
 
               {#if admin}
                 <div class="q-actions" style="display: flex; align-items: center; gap: 6px;">
-                  {#if item.is_answered === 0}
-                    <button
-                      type="button"
-                      class="btn btn-secondary btn-sm"
-                      on:click={() => moderateQuestion(item.id, item.is_answering === 1 ? 'finish_answering' : 'answer')}
-                      disabled={moderateBusy.has(item.id)}
-                    >{item.is_answering === 1 ? 'Done' : 'Answer'}</button>
-                  {/if}
+                  {#if sessionData?.is_active === 1}
+                    {#if item.is_answered === 0}
+                      <button
+                        type="button"
+                        class="btn btn-secondary btn-sm"
+                        on:click={() => moderateQuestion(item.id, item.is_answering === 1 ? 'finish_answering' : 'answer')}
+                        disabled={moderateBusy.has(item.id)}
+                      >{item.is_answering === 1 ? 'Done' : 'Answer'}</button>
+                    {/if}
 
-                  {#if item.is_answering === 1 || item.is_answered === 1}
-                    <button
-                      type="button"
-                      class="btn btn-secondary btn-sm"
-                      on:click={() => moderateQuestion(item.id, 'reopen')}
-                      disabled={moderateBusy.has(item.id)}
-                    >Undo</button>
-                  {/if}
+                    {#if item.is_answering === 1 || item.is_answered === 1}
+                      <button
+                        type="button"
+                        class="btn btn-secondary btn-sm"
+                        on:click={() => moderateQuestion(item.id, 'reopen')}
+                        disabled={moderateBusy.has(item.id)}
+                      >Undo</button>
+                    {/if}
 
-                  {#if item.is_answered === 0 && item.is_rejected === 0}
-                    <button
-                      type="button"
-                      class="btn btn-secondary btn-sm"
-                      on:click={() => moderateQuestion(item.id, 'reject')}
-                      disabled={moderateBusy.has(item.id)}
-                    >Reject</button>
+                    {#if item.is_answered === 0 && item.is_rejected === 0}
+                      <button
+                        type="button"
+                        class="btn btn-secondary btn-sm"
+                        on:click={() => moderateQuestion(item.id, 'reject')}
+                        disabled={moderateBusy.has(item.id)}
+                      >Reject</button>
+                    {/if}
                   {/if}
 
                   <div style="margin-left: auto; display: flex; gap: 6px;">

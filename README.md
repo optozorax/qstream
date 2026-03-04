@@ -127,7 +127,7 @@ If `RESET_DB_ON_BOOT=true`, backend drops and recreates all tables at startup.
 
 ## Schema changes
 
-The backend runs lightweight migrations at startup via `ALTER TABLE` and table-recreation steps (see `init_db` in `backend/src/main.rs`). This means existing databases are upgraded automatically without data loss for the supported migration paths.
+The backend applies `backend/src/schema.sql` at startup and does not run in-place `ALTER TABLE` migrations.
 
 To start completely fresh:
 

@@ -272,6 +272,8 @@ struct QuestionAdminMeta {
     session_id: i64,
     owner_user_id: i64,
     author_user_id: i64,
+    session_name: Option<String>,
+    question_body: String,
 }
 
 #[derive(Serialize)]
@@ -345,14 +347,50 @@ struct ListQuestionsQuery {
 }
 
 #[derive(FromRow)]
+struct QuestionVoteMetaRow {
+    session_id: i64,
+    owner_user_id: i64,
+    session_is_active: i64,
+    status: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuestionStatus {
+    New,
+    Answering,
+    Answered,
+    Rejected,
+    Deleted,
+}
+
+impl QuestionStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Answering => "answering",
+            Self::Answered => "answered",
+            Self::Rejected => "rejected",
+            Self::Deleted => "deleted",
+        }
+    }
+
+    fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "new" => Some(Self::New),
+            "answering" => Some(Self::Answering),
+            "answered" => Some(Self::Answered),
+            "rejected" => Some(Self::Rejected),
+            "deleted" => Some(Self::Deleted),
+            _ => None,
+        }
+    }
+}
+
 struct QuestionVoteMeta {
     session_id: i64,
     owner_user_id: i64,
     session_is_active: i64,
-    is_answering: i64,
-    is_answered: i64,
-    is_rejected: i64,
-    is_deleted: i64,
+    status: QuestionStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -559,8 +597,8 @@ async fn get_me(State(state): State<AppState>, headers: HeaderMap) -> Result<Jso
         SELECT
             id,
             nickname,
-            CAST(created_at AS INTEGER) AS created_at,
-            CAST(last_login_at AS INTEGER) AS last_login_at
+            created_at,
+            last_login_at
         FROM users
         WHERE id = ?1
         LIMIT 1;
@@ -729,8 +767,8 @@ async fn google_oauth_callback(
         RETURNING
             id,
             nickname,
-            CAST(created_at AS INTEGER) AS created_at,
-            CAST(last_login_at AS INTEGER) AS last_login_at;
+            created_at,
+            last_login_at;
         "#,
     )
     .bind(&nickname)
@@ -761,7 +799,7 @@ async fn list_user_sessions(
             id,
             owner_user_id,
             public_code,
-            CAST(created_at AS INTEGER) AS created_at,
+            created_at,
             is_active,
             name,
             description,
@@ -770,7 +808,7 @@ async fn list_user_sessions(
             downvote_threshold
         FROM stream_sessions
         WHERE owner_user_id = ?1
-        ORDER BY CAST(created_at AS INTEGER) DESC;
+        ORDER BY created_at DESC;
         "#,
     )
     .bind(auth.user_id)
@@ -879,7 +917,7 @@ async fn create_session(
             id,
             owner_user_id,
             public_code,
-            CAST(created_at AS INTEGER) AS created_at,
+            created_at,
             is_active,
             name,
             description,
@@ -929,9 +967,9 @@ async fn list_questions(
         let row: (Option<i64>, i64) = sqlx::query_as(
             r#"
             SELECT
-                (SELECT CAST(created_at AS INTEGER) FROM questions
+                (SELECT created_at FROM questions
                  WHERE session_id = ?1 AND author_user_id = ?2
-                 ORDER BY CAST(created_at AS INTEGER) DESC LIMIT 1),
+                 ORDER BY created_at DESC LIMIT 1),
                 EXISTS(SELECT 1 FROM bans WHERE owner_user_id = ?3 AND user_id = ?2)
             "#,
         )
@@ -1124,7 +1162,7 @@ async fn create_question(
             FROM questions
             WHERE session_id = ?1
               AND author_user_id = ?2
-              AND CAST(created_at AS INTEGER) > unixepoch() - 60
+              AND created_at > unixepoch() - 60
         );
         "#,
     )
@@ -1171,10 +1209,10 @@ async fn vote_question(
         return Err(AppError::bad_request("vote value must be -1, 0, or 1"));
     }
 
-    let question_meta = sqlx::query_as::<_, QuestionVoteMeta>(
+    let question_meta_row = sqlx::query_as::<_, QuestionVoteMetaRow>(
         r#"
         SELECT q.session_id, s.owner_user_id, s.is_active AS session_is_active,
-               q.is_answering, q.is_answered, q.is_rejected, q.is_deleted
+               q.status
         FROM questions q
         JOIN stream_sessions s ON s.id = q.session_id
         WHERE q.id = ?1;
@@ -1186,6 +1224,18 @@ async fn vote_question(
     .map_err(|err| AppError::internal(format!("failed to find question: {err}")))?
     .ok_or_else(|| AppError::not_found("question not found"))?;
 
+    let question_meta = QuestionVoteMeta {
+        session_id: question_meta_row.session_id,
+        owner_user_id: question_meta_row.owner_user_id,
+        session_is_active: question_meta_row.session_is_active,
+        status: QuestionStatus::from_db(&question_meta_row.status).ok_or_else(|| {
+            AppError::internal(format!(
+                "unknown question status: {}",
+                question_meta_row.status
+            ))
+        })?,
+    };
+
     if question_meta.owner_user_id == auth.user_id {
         return Err(AppError::forbidden(
             "session owner cannot vote for questions",
@@ -1196,18 +1246,19 @@ async fn vote_question(
         return Err(AppError::forbidden("session is stopped"));
     }
 
-    if question_meta.is_answered == 1 || question_meta.is_answering == 1 {
-        return Err(AppError::bad_request(
-            "cannot vote for answered or in-progress questions",
-        ));
-    }
-
-    if question_meta.is_rejected == 1 {
-        return Err(AppError::bad_request("cannot vote for rejected questions"));
-    }
-
-    if question_meta.is_deleted == 1 {
-        return Err(AppError::bad_request("cannot vote for deleted questions"));
+    match question_meta.status {
+        QuestionStatus::New => {}
+        QuestionStatus::Answering | QuestionStatus::Answered => {
+            return Err(AppError::bad_request(
+                "cannot vote for answered or in-progress questions",
+            ));
+        }
+        QuestionStatus::Rejected => {
+            return Err(AppError::bad_request("cannot vote for rejected questions"));
+        }
+        QuestionStatus::Deleted => {
+            return Err(AppError::bad_request("cannot vote for deleted questions"));
+        }
     }
 
     if is_user_banned(&state.db, question_meta.owner_user_id, auth.user_id).await? {
@@ -1260,42 +1311,91 @@ async fn vote_question(
         .await
         .map_err(|err| AppError::internal(format!("failed to cleanup vote actions: {err}")))?;
 
-    if payload.value == 0 {
-        sqlx::query("DELETE FROM votes WHERE question_id = ?1 AND user_id = ?2;")
+    let previous_vote: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT value
+        FROM votes
+        WHERE question_id = ?1 AND user_id = ?2
+        LIMIT 1;
+        "#,
+    )
+    .bind(question_id)
+    .bind(auth.user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to read previous vote: {err}")))?;
+
+    let (delta, user_vote) = match (previous_vote, payload.value) {
+        (None, 0) => (0_i64, 0_i64),
+        (None, new_value) => {
+            sqlx::query(
+                r#"
+                INSERT INTO votes (question_id, user_id, value, created_at, updated_at)
+                VALUES (?1, ?2, ?3, unixepoch(), unixepoch());
+                "#,
+            )
             .bind(question_id)
             .bind(auth.user_id)
+            .bind(new_value)
             .execute(&mut *tx)
             .await
-            .map_err(|err| AppError::internal(format!("failed to remove vote: {err}")))?;
-    } else {
+            .map_err(|err| AppError::internal(format!("failed to save vote: {err}")))?;
+            (new_value, new_value)
+        }
+        (Some(old_value), 0) => {
+            sqlx::query("DELETE FROM votes WHERE question_id = ?1 AND user_id = ?2;")
+                .bind(question_id)
+                .bind(auth.user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|err| AppError::internal(format!("failed to remove vote: {err}")))?;
+            (-old_value, 0)
+        }
+        (Some(old_value), new_value) => {
+            sqlx::query(
+                r#"
+                UPDATE votes
+                SET value = ?3, updated_at = unixepoch()
+                WHERE question_id = ?1 AND user_id = ?2;
+                "#,
+            )
+            .bind(question_id)
+            .bind(auth.user_id)
+            .bind(new_value)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| AppError::internal(format!("failed to update vote: {err}")))?;
+            (new_value - old_value, new_value)
+        }
+    };
+
+    if delta != 0 {
         sqlx::query(
             r#"
-            INSERT INTO votes (question_id, user_id, value, created_at, updated_at)
-            VALUES (?1, ?2, ?3, unixepoch(), unixepoch())
-            ON CONFLICT(question_id, user_id) DO UPDATE
-            SET value = excluded.value,
-                updated_at = unixepoch();
+            UPDATE questions
+            SET score = score + ?1
+            WHERE id = ?2;
             "#,
         )
+        .bind(delta)
         .bind(question_id)
-        .bind(auth.user_id)
-        .bind(payload.value)
         .execute(&mut *tx)
         .await
-        .map_err(|err| AppError::internal(format!("failed to save vote: {err}")))?;
+        .map_err(|err| AppError::internal(format!("failed to update question score: {err}")))?;
     }
 
     let score: i64 = sqlx::query_scalar(
         r#"
-        SELECT COALESCE(SUM(value), 0)
-        FROM votes
-        WHERE question_id = ?1;
+        SELECT score
+        FROM questions
+        WHERE id = ?1
+        LIMIT 1;
         "#,
     )
     .bind(question_id)
     .fetch_one(&mut *tx)
     .await
-    .map_err(|err| AppError::internal(format!("failed to recalculate score: {err}")))?;
+    .map_err(|err| AppError::internal(format!("failed to fetch question score: {err}")))?;
 
     tx.commit()
         .await
@@ -1319,7 +1419,7 @@ async fn vote_question(
     Ok(Json(VoteResponse {
         question_id,
         score,
-        user_vote: payload.value,
+        user_vote,
     }))
 }
 
@@ -1333,7 +1433,11 @@ async fn moderate_question(
 
     let meta = sqlx::query_as::<_, QuestionAdminMeta>(
         r#"
-        SELECT s.id AS session_id, s.owner_user_id, q.author_user_id
+        SELECT s.id AS session_id,
+               s.owner_user_id,
+               q.author_user_id,
+               s.name AS session_name,
+               q.body AS question_body
         FROM questions q
         JOIN stream_sessions s ON s.id = q.session_id
         WHERE q.id = ?1
@@ -1357,11 +1461,16 @@ async fn moderate_question(
             let update = sqlx::query(
                 r#"
                 UPDATE questions
-                SET is_answering = 1, answering_started_at = unixepoch()
-                WHERE id = ?1 AND is_answered = 0;
+                SET status = ?2,
+                    answering_started_at = unixepoch(),
+                    answered_at = NULL
+                WHERE id = ?1 AND status IN (?3, ?4);
                 "#,
             )
             .bind(question_id)
+            .bind(QuestionStatus::Answering.as_str())
+            .bind(QuestionStatus::New.as_str())
+            .bind(QuestionStatus::Rejected.as_str())
             .execute(&state.db)
             .await
             .map_err(|err| {
@@ -1370,7 +1479,7 @@ async fn moderate_question(
 
             if update.rows_affected() == 0 {
                 return Err(AppError::bad_request(
-                    "cannot mark already answered question as in-progress",
+                    "cannot mark this question as in-progress",
                 ));
             }
 
@@ -1396,13 +1505,14 @@ async fn moderate_question(
             let update = sqlx::query(
                 r#"
                 UPDATE questions
-                SET is_answered = 1,
-                    is_answering = 0,
+                SET status = ?2,
                     answered_at = unixepoch()
-                WHERE id = ?1 AND is_answering = 1 AND is_answered = 0;
+                WHERE id = ?1 AND status = ?3;
                 "#,
             )
             .bind(question_id)
+            .bind(QuestionStatus::Answered.as_str())
+            .bind(QuestionStatus::Answering.as_str())
             .execute(&state.db)
             .await
             .map_err(|err| {
@@ -1433,11 +1543,16 @@ async fn moderate_question(
             let update = sqlx::query(
                 r#"
                 UPDATE questions
-                SET is_rejected = 1
-                WHERE id = ?1 AND is_answered = 0 AND is_rejected = 0;
+                SET status = ?2,
+                    answering_started_at = NULL,
+                    answered_at = NULL
+                WHERE id = ?1 AND status IN (?3, ?4);
                 "#,
             )
             .bind(question_id)
+            .bind(QuestionStatus::Rejected.as_str())
+            .bind(QuestionStatus::New.as_str())
+            .bind(QuestionStatus::Answering.as_str())
             .execute(&state.db)
             .await
             .map_err(|err| AppError::internal(format!("failed to reject question: {err}")))?;
@@ -1463,15 +1578,16 @@ async fn moderate_question(
             }))
         }
         "delete" => {
-            // Soft-delete: set is_deleted = 1 instead of removing from DB
+            // Soft-delete: mark question as deleted instead of removing from DB.
             sqlx::query(
                 r#"
                 UPDATE questions
-                SET is_deleted = 1
-                WHERE id = ?1;
+                SET status = ?2
+                WHERE id = ?1 AND status != ?2;
                 "#,
             )
             .bind(question_id)
+            .bind(QuestionStatus::Deleted.as_str())
             .execute(&state.db)
             .await
             .map_err(|err| AppError::internal(format!("failed to delete question: {err}")))?;
@@ -1495,14 +1611,18 @@ async fn moderate_question(
 
             sqlx::query(
                 r#"
-                INSERT INTO bans (owner_user_id, user_id, question_id, created_at)
-                VALUES (?1, ?2, ?3, unixepoch())
-                ON CONFLICT(owner_user_id, user_id) DO NOTHING;
+                INSERT INTO bans (owner_user_id, user_id, message, session_name, created_at)
+                VALUES (?1, ?2, ?3, ?4, unixepoch())
+                ON CONFLICT(owner_user_id, user_id) DO UPDATE
+                SET message = excluded.message,
+                    session_name = excluded.session_name,
+                    created_at = unixepoch();
                 "#,
             )
             .bind(auth.user_id)
             .bind(meta.author_user_id)
-            .bind(question_id)
+            .bind(&meta.question_body)
+            .bind(&meta.session_name)
             .execute(&state.db)
             .await
             .map_err(|err| AppError::internal(format!("failed to ban user: {err}")))?;
@@ -1510,12 +1630,13 @@ async fn moderate_question(
             sqlx::query(
                 r#"
                 UPDATE questions
-                SET is_deleted = 1
-                WHERE session_id = ?1 AND author_user_id = ?2 AND is_deleted = 0;
+                SET status = ?3
+                WHERE session_id = ?1 AND author_user_id = ?2 AND status != ?3;
                 "#,
             )
             .bind(meta.session_id)
             .bind(meta.author_user_id)
+            .bind(QuestionStatus::Deleted.as_str())
             .execute(&state.db)
             .await
             .map_err(|err| {
@@ -1544,14 +1665,16 @@ async fn moderate_question(
             let update = sqlx::query(
                 r#"
                 UPDATE questions
-                SET is_answering = 0,
-                    is_answered = 0,
+                SET status = ?2,
                     answering_started_at = NULL,
                     answered_at = NULL
-                WHERE id = ?1 AND (is_answering = 1 OR is_answered = 1);
+                WHERE id = ?1 AND status IN (?3, ?4);
                 "#,
             )
             .bind(question_id)
+            .bind(QuestionStatus::New.as_str())
+            .bind(QuestionStatus::Answering.as_str())
+            .bind(QuestionStatus::Answered.as_str())
             .execute(&state.db)
             .await
             .map_err(|err| AppError::internal(format!("failed to reopen question: {err}")))?;
@@ -1738,14 +1861,15 @@ async fn list_bans(
 
     let bans = sqlx::query_as::<_, BannedUser>(
         r#"
-        SELECT b.user_id, u.nickname, CAST(b.created_at AS INTEGER) AS banned_at,
-               q.body AS question_body, ss.name AS session_name
+        SELECT b.user_id,
+               u.nickname,
+               b.created_at AS banned_at,
+               b.message AS question_body,
+               b.session_name
         FROM bans b
         JOIN users u ON u.id = b.user_id
-        LEFT JOIN questions q ON q.id = b.question_id
-        LEFT JOIN stream_sessions ss ON ss.id = q.session_id
         WHERE b.owner_user_id = ?1
-        ORDER BY CAST(b.created_at AS INTEGER) DESC;
+        ORDER BY b.created_at DESC;
         "#,
     )
     .bind(auth.user_id)
@@ -1837,7 +1961,7 @@ async fn find_session_by_code(db: &SqlitePool, code: &str) -> Result<StreamSessi
             id,
             owner_user_id,
             public_code,
-            CAST(created_at AS INTEGER) AS created_at,
+            created_at,
             is_active,
             name,
             description,
@@ -1864,27 +1988,40 @@ async fn list_questions_for_session(
     downvote_threshold: i64,
 ) -> Result<Vec<QuestionView>, AppError> {
     let threshold = downvote_threshold.max(1);
+    let status_new = QuestionStatus::New.as_str();
+    let status_answering = QuestionStatus::Answering.as_str();
+    let status_answered = QuestionStatus::Answered.as_str();
+    let status_rejected = QuestionStatus::Rejected.as_str();
+    let status_deleted = QuestionStatus::Deleted.as_str();
 
-    let (filter, having, order_by): (&str, String, &str) = match sort {
+    let (filter, order_by): (String, String) = match sort {
         QuestionSort::Answered => (
-            "WHERE q.session_id = ?1 AND (q.is_answered = 1 OR q.is_rejected = 1) AND q.is_deleted = 0",
-            String::new(),
-            "ORDER BY COALESCE(CAST(q.answered_at AS INTEGER), CAST(q.created_at AS INTEGER)) DESC",
+            format!(
+                "WHERE q.session_id = ?1 AND q.status IN ('{status_answered}', '{status_rejected}')"
+            ),
+            "ORDER BY COALESCE(q.answered_at, q.created_at) DESC".to_string(),
         ),
         QuestionSort::New => (
-            "WHERE q.session_id = ?1 AND q.is_answered = 0 AND q.is_rejected = 0 AND q.is_deleted = 0",
-            format!("HAVING score > -{threshold} OR q.is_answering = 1"),
-            "ORDER BY q.is_answering DESC, CAST(q.created_at AS INTEGER) DESC",
+            format!(
+                "WHERE q.session_id = ?1 AND q.status IN ('{status_new}', '{status_answering}') \
+                 AND (q.score > -{threshold} OR q.status = '{status_answering}')"
+            ),
+            format!("ORDER BY (q.status = '{status_answering}') DESC, q.created_at DESC"),
         ),
         QuestionSort::Top => (
-            "WHERE q.session_id = ?1 AND q.is_answered = 0 AND q.is_rejected = 0 AND q.is_deleted = 0",
-            format!("HAVING score > -{threshold} OR q.is_answering = 1"),
-            "ORDER BY q.is_answering DESC, score DESC, CAST(q.created_at AS INTEGER) DESC",
+            format!(
+                "WHERE q.session_id = ?1 AND q.status IN ('{status_new}', '{status_answering}') \
+                 AND (q.score > -{threshold} OR q.status = '{status_answering}')"
+            ),
+            format!(
+                "ORDER BY (q.status = '{status_answering}') DESC, q.score DESC, q.created_at DESC"
+            ),
         ),
         QuestionSort::Downvoted => (
-            "WHERE q.session_id = ?1 AND q.is_answered = 0 AND q.is_rejected = 0 AND q.is_deleted = 0 AND q.is_answering = 0",
-            format!("HAVING score <= -{threshold}"),
-            "ORDER BY score ASC, CAST(q.created_at AS INTEGER) DESC",
+            format!(
+                "WHERE q.session_id = ?1 AND q.status = '{status_new}' AND q.score <= -{threshold}"
+            ),
+            "ORDER BY q.score ASC, q.created_at DESC".to_string(),
         ),
     };
 
@@ -1896,25 +2033,28 @@ async fn list_questions_for_session(
             q.author_user_id,
             u.nickname AS author_nickname,
             q.body,
-            q.is_answering,
-            q.is_answered,
-            q.is_rejected,
-            q.is_deleted,
-            CAST(q.created_at AS INTEGER) AS created_at,
-            COALESCE(SUM(v.value), 0) AS score,
-            COALESCE(COUNT(v.user_id), 0) AS votes_count,
-            COALESCE(MAX(uv.value), 0) AS user_vote,
-            CAST(q.answering_started_at AS INTEGER) AS answering_started_at,
-            CAST(q.answered_at AS INTEGER) AS answered_at
+            (q.status = '{status_answering}') AS is_answering,
+            (q.status = '{status_answered}') AS is_answered,
+            (q.status = '{status_rejected}') AS is_rejected,
+            (q.status = '{status_deleted}') AS is_deleted,
+            q.created_at,
+            q.score,
+            (SELECT COUNT(*) FROM votes vv WHERE vv.question_id = q.id) AS votes_count,
+            COALESCE(uv.value, 0) AS user_vote,
+            q.answering_started_at,
+            q.answered_at
         FROM questions q
         JOIN users u ON u.id = q.author_user_id
-        LEFT JOIN votes v ON v.question_id = q.id
         LEFT JOIN votes uv ON uv.question_id = q.id AND uv.user_id = ?2
         {filter}
-        GROUP BY q.id, q.session_id, q.author_user_id, u.nickname, q.body, q.is_answering, q.is_answered, q.is_rejected, q.is_deleted, q.created_at
-        {having}
         {order_by};
-        "#
+        "#,
+        filter = filter,
+        order_by = order_by,
+        status_answering = status_answering,
+        status_answered = status_answered,
+        status_rejected = status_rejected,
+        status_deleted = status_deleted
     );
 
     sqlx::query_as::<_, QuestionView>(&sql)
@@ -1926,7 +2066,12 @@ async fn list_questions_for_session(
 }
 
 async fn fetch_question_by_id(db: &SqlitePool, question_id: i64) -> Result<QuestionView, AppError> {
-    sqlx::query_as::<_, QuestionView>(
+    let status_answering = QuestionStatus::Answering.as_str();
+    let status_answered = QuestionStatus::Answered.as_str();
+    let status_rejected = QuestionStatus::Rejected.as_str();
+    let status_deleted = QuestionStatus::Deleted.as_str();
+
+    let sql = format!(
         r#"
         SELECT
             q.id,
@@ -1934,29 +2079,29 @@ async fn fetch_question_by_id(db: &SqlitePool, question_id: i64) -> Result<Quest
             q.author_user_id,
             u.nickname AS author_nickname,
             q.body,
-            q.is_answering,
-            q.is_answered,
-            q.is_rejected,
-            q.is_deleted,
-            CAST(q.created_at AS INTEGER) AS created_at,
-            COALESCE(SUM(v.value), 0) AS score,
-            COALESCE(COUNT(v.user_id), 0) AS votes_count,
+            (q.status = '{status_answering}') AS is_answering,
+            (q.status = '{status_answered}') AS is_answered,
+            (q.status = '{status_rejected}') AS is_rejected,
+            (q.status = '{status_deleted}') AS is_deleted,
+            q.created_at,
+            q.score,
+            (SELECT COUNT(*) FROM votes vv WHERE vv.question_id = q.id) AS votes_count,
             0 AS user_vote,
-            CAST(q.answering_started_at AS INTEGER) AS answering_started_at,
-            CAST(q.answered_at AS INTEGER) AS answered_at
+            q.answering_started_at,
+            q.answered_at
         FROM questions q
         JOIN users u ON u.id = q.author_user_id
-        LEFT JOIN votes v ON v.question_id = q.id
         WHERE q.id = ?1
-        GROUP BY q.id, q.session_id, q.author_user_id, u.nickname, q.body, q.is_answering, q.is_answered, q.is_rejected, q.is_deleted, q.created_at
         LIMIT 1;
-        "#,
-    )
-    .bind(question_id)
-    .fetch_optional(db)
-    .await
-    .map_err(|err| AppError::internal(format!("failed to fetch question: {err}")))?
-    .ok_or_else(|| AppError::not_found("question not found"))
+        "#
+    );
+
+    sqlx::query_as::<_, QuestionView>(&sql)
+        .bind(question_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to fetch question: {err}")))?
+        .ok_or_else(|| AppError::not_found("question not found"))
 }
 
 async fn is_user_banned(

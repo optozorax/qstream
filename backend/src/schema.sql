@@ -41,22 +41,24 @@ CREATE TABLE IF NOT EXISTS stream_sessions (
     downvote_threshold INTEGER NOT NULL DEFAULT 5
 );
 
+CREATE INDEX IF NOT EXISTS idx_stream_sessions_owner_created_at
+    ON stream_sessions(owner_user_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS questions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER NOT NULL REFERENCES stream_sessions(id) ON DELETE CASCADE,
     author_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     body TEXT NOT NULL CHECK (length(body) BETWEEN 1 AND 300),
-    is_answering INTEGER NOT NULL DEFAULT 0 CHECK (is_answering IN (0, 1)),
-    is_answered INTEGER NOT NULL DEFAULT 0 CHECK (is_answered IN (0, 1)),
-    is_rejected INTEGER NOT NULL DEFAULT 0 CHECK (is_rejected IN (0, 1)),
-    is_deleted INTEGER NOT NULL DEFAULT 0 CHECK (is_deleted IN (0, 1)),
+    status TEXT NOT NULL DEFAULT 'new'
+        CHECK (status IN ('new', 'answering', 'answered', 'rejected', 'deleted')),
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     answering_started_at INTEGER,
-    answered_at INTEGER
+    answered_at INTEGER,
+    score INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_questions_new
-    ON questions(session_id, created_at DESC);
+    ON questions(session_id, status, created_at DESC);
 
 -- Used by API-side "one question per minute" checks.
 CREATE INDEX IF NOT EXISTS idx_questions_rate_limit
@@ -70,9 +72,6 @@ CREATE TABLE IF NOT EXISTS votes (
     updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
     PRIMARY KEY (question_id, user_id)
 );
-
-CREATE INDEX IF NOT EXISTS idx_votes_question
-    ON votes(question_id);
 
 CREATE INDEX IF NOT EXISTS idx_votes_user_rate_limit
     ON votes(user_id, updated_at);
@@ -88,11 +87,17 @@ CREATE TABLE IF NOT EXISTS vote_actions (
 CREATE INDEX IF NOT EXISTS idx_vote_actions_user_created_at
     ON vote_actions(user_id, created_at);
 
+CREATE INDEX IF NOT EXISTS idx_vote_actions_created_at
+    ON vote_actions(created_at);
+
 CREATE TABLE IF NOT EXISTS bans (
     owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    question_id INTEGER REFERENCES questions(id),
-    reason TEXT,
+    message TEXT,
+    session_name TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     PRIMARY KEY (owner_user_id, user_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_bans_owner_created_at
+    ON bans(owner_user_id, created_at DESC);

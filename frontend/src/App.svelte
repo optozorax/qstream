@@ -99,6 +99,7 @@
   let deletingSessionCode = null
 
   let sessionSort = 'top'
+  let loadedSessionSort = 'top'
   let sessionData = null
   let questions = []
   let loadingQuestions = false
@@ -195,6 +196,7 @@
     cancelRefreshQuestions()
     sessionData = null
     questions = []
+    loadedSessionSort = 'top'
     questionText = ''
     updateMode = 'manual'
     updateModeTouched = false
@@ -693,6 +695,7 @@
 
       sessionData = payload.session
       questions = payload.questions
+      loadedSessionSort = payload.sort ?? requestedSort
       const serverVotes = {}
       for (const q of payload.questions) {
         if (q.user_vote !== 0) serverVotes[q.id] = q.user_vote
@@ -1541,12 +1544,12 @@
       </div>
 
       <!-- Question list -->
-      {#if sessionSort === 'downvoted' && sessionData && !loadingQuestions}
+      {#if loadedSessionSort === 'downvoted' && sessionData}
         <div class="msg msg-info" style="margin-bottom: 12px; text-align: center;">
           Questions with a score of −{sessionData.downvote_threshold ?? 5} or lower are hidden from other tabs.
         </div>
       {/if}
-      {#if sessionSort === 'deleted' && sessionData && !loadingQuestions}
+      {#if loadedSessionSort === 'deleted' && sessionData}
         <div class="msg msg-info" style="margin-bottom: 12px; text-align: center;">
           Only the session owner can see deleted questions.
         </div>
@@ -1558,7 +1561,7 @@
             <p>
               {#if hideInteracted && currentUser}
                 All questions filtered.
-              {:else if sessionSort === 'deleted'}
+              {:else if loadedSessionSort === 'deleted'}
                 No deleted questions.
               {:else}
                 No questions yet.

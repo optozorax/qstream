@@ -367,6 +367,10 @@ textarea:focus {
   min-width: 48px;
 }
 
+.q-card.donation .q-vote-col {
+  justify-content: center;
+}
+
 .q-vote-btn {
   display: flex;
   align-items: center;
@@ -438,6 +442,11 @@ textarea:focus {
 
 .q-meta-sep {
   color: var(--border);
+}
+
+.q-meta-donation-label {
+  color: color-mix(in srgb, var(--orange) 70%, var(--ink-tertiary));
+  font-weight: 600;
 }
 
 .q-actions {
@@ -746,6 +755,13 @@ textarea:focus {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.settings-separator {
+  width: 100%;
+  margin: 2px 0;
+  border: 0;
+  border-top: 1px solid var(--border);
 }
 
 .flex-row-gap-sm {

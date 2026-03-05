@@ -38,11 +38,64 @@ CREATE TABLE IF NOT EXISTS stream_sessions (
     description TEXT,
     stream_link TEXT,
     stopped_at INTEGER,
-    downvote_threshold INTEGER NOT NULL DEFAULT 5
+    downvote_threshold INTEGER NOT NULL DEFAULT 5,
+    donations_enabled INTEGER NOT NULL DEFAULT 1 CHECK (donations_enabled IN (0, 1)),
+    donations_enabled_at INTEGER,
+    donations_min_external_id INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_stream_sessions_owner_created_at
     ON stream_sessions(owner_user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS da_oauth_states (
+    state TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    return_to TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    expires_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_da_oauth_states_expires_at
+    ON da_oauth_states(expires_at);
+
+CREATE TABLE IF NOT EXISTS da_integrations (
+    owner_user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    da_user_id INTEGER NOT NULL,
+    access_token TEXT NOT NULL,
+    refresh_token TEXT NOT NULL,
+    token_expires_at INTEGER NOT NULL,
+    scope TEXT NOT NULL,
+    last_seen_external_id INTEGER,
+    last_sync_at INTEGER,
+    last_error TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE TABLE IF NOT EXISTS donations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES stream_sessions(id) ON DELETE CASCADE,
+    owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    external_donation_id INTEGER NOT NULL,
+    donor_name TEXT NOT NULL,
+    body TEXT NOT NULL CHECK (length(body) <= 300),
+    amount_minor INTEGER NOT NULL,
+    currency TEXT NOT NULL,
+    usd_cents INTEGER NOT NULL,
+    provider_created_at TEXT,
+    status TEXT NOT NULL DEFAULT 'new'
+        CHECK (status IN ('new', 'answering', 'answered', 'rejected', 'deleted')),
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    answering_started_at INTEGER,
+    answered_at INTEGER,
+    UNIQUE(owner_user_id, external_donation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_donations_session_status_created
+    ON donations(session_id, status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_donations_owner_external
+    ON donations(owner_user_id, external_donation_id DESC);
 
 CREATE TABLE IF NOT EXISTS questions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

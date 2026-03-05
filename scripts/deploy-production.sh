@@ -96,6 +96,9 @@ DEPLOY_DATABASE_URL="${DEPLOY_DATABASE_URL:-sqlite:///var/lib/qstream/qstream.db
 DEPLOY_GOOGLE_CLIENT_ID="${DEPLOY_GOOGLE_CLIENT_ID:-${GOOGLE_CLIENT_ID:-}}"
 DEPLOY_GOOGLE_CLIENT_SECRET="${DEPLOY_GOOGLE_CLIENT_SECRET:-${GOOGLE_CLIENT_SECRET:-}}"
 DEPLOY_GOOGLE_REDIRECT_URI="${DEPLOY_GOOGLE_REDIRECT_URI:-${GOOGLE_REDIRECT_URI:-https://${DEPLOY_PUBLIC_HOST}/api/google_oauth2}}"
+DEPLOY_DA_CLIENT_ID="${DEPLOY_DA_CLIENT_ID:-${DA_CLIENT_ID:-}}"
+DEPLOY_DA_CLIENT_SECRET="${DEPLOY_DA_CLIENT_SECRET:-${DA_CLIENT_SECRET:-}}"
+DEPLOY_DA_REDIRECT_URI="${DEPLOY_DA_REDIRECT_URI:-${DA_REDIRECT_URI:-}}"
 
 INSTALL_FRONTEND_DEPS="${INSTALL_FRONTEND_DEPS:-1}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
@@ -219,6 +222,11 @@ write_backend_env_file() {
   printf 'GOOGLE_CLIENT_ID=%s\n' "${DEPLOY_GOOGLE_CLIENT_ID}" >> "${file}"
   printf 'GOOGLE_CLIENT_SECRET=%s\n' "${DEPLOY_GOOGLE_CLIENT_SECRET}" >> "${file}"
   printf 'GOOGLE_REDIRECT_URI=%s\n' "${DEPLOY_GOOGLE_REDIRECT_URI}" >> "${file}"
+  if [[ "${DEPLOY_DA_ENABLED}" == "1" ]]; then
+    printf 'DA_CLIENT_ID=%s\n' "${DEPLOY_DA_CLIENT_ID}" >> "${file}"
+    printf 'DA_CLIENT_SECRET=%s\n' "${DEPLOY_DA_CLIENT_SECRET}" >> "${file}"
+    printf 'DA_REDIRECT_URI=%s\n' "${DEPLOY_DA_REDIRECT_URI}" >> "${file}"
+  fi
   printf 'RESET_DB_ON_BOOT=false\n' >> "${file}"
   printf 'RUST_LOG=info\n' >> "${file}"
 }
@@ -285,6 +293,19 @@ assert_single_line "${DEPLOY_GOOGLE_CLIENT_ID}" "DEPLOY_GOOGLE_CLIENT_ID"
 assert_single_line "${DEPLOY_GOOGLE_CLIENT_SECRET}" "DEPLOY_GOOGLE_CLIENT_SECRET"
 assert_single_line "${DEPLOY_GOOGLE_REDIRECT_URI}" "DEPLOY_GOOGLE_REDIRECT_URI"
 
+DEPLOY_DA_ENABLED=0
+if [[ -n "${DEPLOY_DA_CLIENT_ID}" || -n "${DEPLOY_DA_CLIENT_SECRET}" || -n "${DEPLOY_DA_REDIRECT_URI}" ]]; then
+  DEPLOY_DA_ENABLED=1
+  require_non_empty "${DEPLOY_DA_CLIENT_ID}" "DEPLOY_DA_CLIENT_ID"
+  require_non_empty "${DEPLOY_DA_CLIENT_SECRET}" "DEPLOY_DA_CLIENT_SECRET"
+  if [[ -z "${DEPLOY_DA_REDIRECT_URI}" ]]; then
+    DEPLOY_DA_REDIRECT_URI="https://${DEPLOY_PUBLIC_HOST}/api/da/oauth/callback"
+  fi
+  assert_single_line "${DEPLOY_DA_CLIENT_ID}" "DEPLOY_DA_CLIENT_ID"
+  assert_single_line "${DEPLOY_DA_CLIENT_SECRET}" "DEPLOY_DA_CLIENT_SECRET"
+  assert_single_line "${DEPLOY_DA_REDIRECT_URI}" "DEPLOY_DA_REDIRECT_URI"
+fi
+
 validate_port "${DEPLOY_BACKEND_PORT}" "DEPLOY_BACKEND_PORT"
 [[ -f "${DEPLOY_SSH_KEY_PATH}" ]] || die "SSH key not found: ${DEPLOY_SSH_KEY_PATH}"
 
@@ -303,13 +324,21 @@ if [[ "${SKIP_BUILD}" != "1" ]]; then
   require_cmd rustup
   if [[ "${DEPLOY_RUST_TARGET}" == *-musl ]]; then
     require_cmd musl-gcc
+    require_cmd perl
+    require_cmd make
   fi
 
   log "Ensuring Rust target is installed: ${DEPLOY_RUST_TARGET}"
   rustup target add "${DEPLOY_RUST_TARGET}" >/dev/null
 
   log "Building backend release binary for ${DEPLOY_RUST_TARGET}..."
-  (cd backend && cargo build --release --target "${DEPLOY_RUST_TARGET}")
+  (
+    cd backend
+    if [[ "${DEPLOY_RUST_TARGET}" == *-musl ]]; then
+      export OPENSSL_STATIC=1
+    fi
+    cargo build --release --target "${DEPLOY_RUST_TARGET}"
+  )
 
   if [[ "${INSTALL_FRONTEND_DEPS}" == "1" && ! -d frontend/node_modules ]]; then
     log "Installing frontend dependencies (npm ci)..."

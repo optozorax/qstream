@@ -12,7 +12,7 @@ use axum::{
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{sqlite::SqlitePoolOptions, FromRow, SqlitePool};
+use sqlx::{sqlite::SqlitePoolOptions, FromRow, Row, SqlitePool};
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -35,6 +35,9 @@ struct AppState {
     google_client_id: Option<String>,
     google_client_secret: Option<String>,
     google_redirect_uri: Option<String>,
+    da_client_id: Option<String>,
+    da_client_secret: Option<String>,
+    da_redirect_uri: Option<String>,
     public_base_url: String,
     session_events: SessionEventBus,
     sse_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
@@ -82,6 +85,7 @@ impl SessionEventBus {
 struct SessionEvent {
     kind: &'static str,
     question_id: Option<i64>,
+    donation_id: Option<i64>,
 }
 
 impl SessionEvent {
@@ -89,6 +93,7 @@ impl SessionEvent {
         Self {
             kind: "question_created",
             question_id: Some(question_id),
+            donation_id: None,
         }
     }
 
@@ -96,6 +101,7 @@ impl SessionEvent {
         Self {
             kind: "question_changed",
             question_id: Some(question_id),
+            donation_id: None,
         }
     }
 
@@ -103,6 +109,31 @@ impl SessionEvent {
         Self {
             kind: "question_deleted",
             question_id: Some(question_id),
+            donation_id: None,
+        }
+    }
+
+    fn donation_created(donation_id: i64) -> Self {
+        Self {
+            kind: "donation_created",
+            question_id: None,
+            donation_id: Some(donation_id),
+        }
+    }
+
+    fn donation_changed(donation_id: i64) -> Self {
+        Self {
+            kind: "donation_changed",
+            question_id: None,
+            donation_id: Some(donation_id),
+        }
+    }
+
+    fn donation_deleted(donation_id: i64) -> Self {
+        Self {
+            kind: "donation_deleted",
+            question_id: None,
+            donation_id: Some(donation_id),
         }
     }
 
@@ -110,6 +141,7 @@ impl SessionEvent {
         Self {
             kind: "resync",
             question_id: None,
+            donation_id: None,
         }
     }
 }
@@ -184,7 +216,20 @@ struct GoogleOAuthStartQuery {
 }
 
 #[derive(Deserialize, Default)]
+struct DonationAlertsOAuthStartQuery {
+    return_to: Option<String>,
+    auth_token: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
 struct GoogleOAuthCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct DonationAlertsOAuthCallbackQuery {
     code: Option<String>,
     state: Option<String>,
     error: Option<String>,
@@ -245,6 +290,9 @@ struct StreamSession {
     stream_link: Option<String>,
     stopped_at: Option<i64>,
     downvote_threshold: i64,
+    donations_enabled: i64,
+    donations_enabled_at: Option<i64>,
+    donations_min_external_id: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -253,6 +301,7 @@ struct UpdateSessionRequest {
     description: Option<String>,
     stream_link: Option<String>,
     downvote_threshold: Option<i64>,
+    donations_enabled: Option<bool>,
 }
 
 #[derive(Serialize, FromRow)]
@@ -275,6 +324,53 @@ struct QuestionView {
     answered_at: Option<i64>,
 }
 
+#[derive(Serialize, FromRow)]
+struct FeedItemView {
+    id: i64,
+    kind: String,
+    question_id: Option<i64>,
+    donation_id: Option<i64>,
+    session_id: i64,
+    author_user_id: Option<i64>,
+    author_nickname: String,
+    author_is_banned: i64,
+    body: String,
+    is_answering: i64,
+    is_answered: i64,
+    is_rejected: i64,
+    is_deleted: i64,
+    created_at: i64,
+    score: i64,
+    votes_count: i64,
+    user_vote: i64,
+    answering_started_at: Option<i64>,
+    answered_at: Option<i64>,
+    donation_amount_minor: Option<i64>,
+    donation_currency: Option<String>,
+    donation_usd_cents: Option<i64>,
+    donation_external_id: Option<i64>,
+}
+
+#[derive(Serialize, FromRow)]
+struct DonationView {
+    id: i64,
+    session_id: i64,
+    owner_user_id: i64,
+    external_donation_id: i64,
+    donor_name: String,
+    body: String,
+    amount_minor: i64,
+    currency: String,
+    usd_cents: i64,
+    is_answering: i64,
+    is_answered: i64,
+    is_rejected: i64,
+    is_deleted: i64,
+    created_at: i64,
+    answering_started_at: Option<i64>,
+    answered_at: Option<i64>,
+}
+
 #[derive(FromRow)]
 struct AuthUser {
     user_id: i64,
@@ -288,6 +384,19 @@ struct QuestionAdminMeta {
     session_is_active: i64,
     session_name: Option<String>,
     question_body: String,
+}
+
+#[derive(FromRow)]
+struct DonationAdminMeta {
+    session_id: i64,
+    owner_user_id: i64,
+    session_is_active: i64,
+}
+
+#[derive(FromRow)]
+struct SessionAnsweringConflicts {
+    has_question: i64,
+    has_donation: i64,
 }
 
 #[derive(Serialize)]
@@ -305,7 +414,7 @@ struct ListUserSessionsResponse {
 struct ListQuestionsResponse {
     session: StreamSession,
     sort: QuestionSort,
-    questions: Vec<QuestionView>,
+    questions: Vec<FeedItemView>,
     question_cooldown_remaining: i64,
     viewer_is_banned: bool,
 }
@@ -339,6 +448,40 @@ struct ModerateQuestionResponse {
     question: Option<QuestionView>,
 }
 
+#[derive(Deserialize)]
+struct ModerateDonationRequest {
+    action: ModerateDonationAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ModerateDonationAction {
+    Answer,
+    FinishAnswering,
+    Reject,
+    Reopen,
+    Restore,
+    Delete,
+}
+
+#[derive(Serialize)]
+struct ModerateDonationResponse {
+    donation_id: i64,
+    deleted: bool,
+    donation: Option<DonationView>,
+}
+
+#[derive(Serialize, FromRow)]
+struct DonationIntegrationStatus {
+    connected: i64,
+    da_user_id: Option<i64>,
+    scope: Option<String>,
+    token_expires_at: Option<i64>,
+    last_seen_external_id: Option<i64>,
+    last_sync_at: Option<i64>,
+    last_error: Option<String>,
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     ok: bool,
@@ -353,6 +496,56 @@ struct GoogleTokenResponse {
 struct GoogleUserInfoResponse {
     sub: String,
     name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DonationAlertsTokenResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_in: Option<i64>,
+    scope: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DonationAlertsUserOauthResponse {
+    data: DonationAlertsUserOauthData,
+}
+
+#[derive(Debug, Deserialize)]
+struct DonationAlertsUserOauthData {
+    id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DonationAlertsDonationsResponse {
+    data: Vec<DonationAlertsDonation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DonationAlertsDonation {
+    id: i64,
+    username: Option<String>,
+    message: Option<String>,
+    amount: f64,
+    currency: String,
+    created_at: Option<String>,
+}
+
+#[derive(Clone, FromRow)]
+struct DaIntegrationAuthRow {
+    owner_user_id: i64,
+    da_user_id: i64,
+    access_token: String,
+    refresh_token: String,
+    token_expires_at: i64,
+    scope: String,
+    last_seen_external_id: Option<i64>,
+}
+
+#[derive(FromRow)]
+struct DonationSyncSessionRow {
+    session_id: i64,
+    min_external_id: Option<i64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -437,6 +630,14 @@ async fn main() -> anyhow::Result<()> {
     let google_client_id = env::var("GOOGLE_CLIENT_ID").ok();
     let google_client_secret = env::var("GOOGLE_CLIENT_SECRET").ok();
     let google_redirect_uri = env::var("GOOGLE_REDIRECT_URI").ok();
+    let da_client_id = env::var("DA_CLIENT_ID").ok();
+    let da_client_secret = env::var("DA_CLIENT_SECRET").ok();
+    let da_redirect_uri = env::var("DA_REDIRECT_URI").ok().or_else(|| {
+        Some(format!(
+            "{}/api/da/oauth/callback",
+            public_base_url.trim_end_matches('/')
+        ))
+    });
     let reset_db_on_boot = env::var("RESET_DB_ON_BOOT")
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
@@ -446,6 +647,7 @@ async fn main() -> anyhow::Result<()> {
         addr = %app_addr,
         frontend_origin = %frontend_origin,
         google_oauth_configured = google_client_id.is_some() && google_client_secret.is_some() && google_redirect_uri.is_some(),
+        da_oauth_configured = da_client_id.is_some() && da_client_secret.is_some() && da_redirect_uri.is_some(),
         reset_db = reset_db_on_boot,
         "starting qstream backend"
     );
@@ -487,10 +689,20 @@ async fn main() -> anyhow::Result<()> {
         google_client_id,
         google_client_secret,
         google_redirect_uri,
+        da_client_id,
+        da_client_secret,
+        da_redirect_uri,
         public_base_url,
         session_events,
         sse_connections: Arc::new(Mutex::new(HashMap::new())),
     };
+
+    {
+        let state_for_sync = state.clone();
+        tokio::spawn(async move {
+            donation_sync_loop(state_for_sync).await;
+        });
+    }
 
     let cors = if frontend_origin == "*" {
         CorsLayer::new().allow_origin(Any)
@@ -514,6 +726,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/me", get(get_me))
         .route("/api/google_oauth2/start", get(google_oauth_start))
         .route("/api/google_oauth2", get(google_oauth_callback))
+        .route("/api/da/oauth/start", get(da_oauth_start))
+        .route("/api/da/oauth/callback", get(da_oauth_callback))
+        .route(
+            "/api/da/integration",
+            get(get_da_integration_status).delete(disconnect_da_integration),
+        )
         .route(
             "/api/sessions",
             get(list_user_sessions).post(create_session),
@@ -532,6 +750,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/api/questions/:id/vote", post(vote_question))
         .route("/api/questions/:id/moderate", post(moderate_question))
+        .route("/api/donations/:id/moderate", post(moderate_donation))
         .with_state(state)
         .layer(cors)
         .layer(TraceLayer::new_for_http());
@@ -567,6 +786,8 @@ async fn init_db(db: &SqlitePool, reset_db_on_boot: bool) -> anyhow::Result<()> 
     sqlx::raw_sql(include_str!("schema.sql"))
         .execute(db)
         .await?;
+
+    run_db_migrations(db).await?;
 
     Ok(())
 }
@@ -773,6 +994,438 @@ async fn google_oauth_callback(
     ))
 }
 
+async fn da_oauth_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DonationAlertsOAuthStartQuery>,
+) -> Result<Redirect, AppError> {
+    let auth = match require_auth_user(&state, &headers).await {
+        Ok(auth) => auth,
+        Err(err) if err.status == StatusCode::UNAUTHORIZED => {
+            if let Some(token) = query.auth_token.as_deref() {
+                require_auth_user_by_token(&state, token).await?
+            } else {
+                return Err(err);
+            }
+        }
+        Err(err) => return Err(err),
+    };
+    let client_id = state
+        .da_client_id
+        .as_deref()
+        .ok_or_else(|| AppError::internal("DA_CLIENT_ID is not configured"))?;
+    let redirect_uri = state
+        .da_redirect_uri
+        .as_deref()
+        .ok_or_else(|| AppError::internal("DA_REDIRECT_URI is not configured"))?;
+
+    let return_to = sanitize_return_to(query.return_to.as_deref());
+    let state_token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+
+    sqlx::query("DELETE FROM da_oauth_states WHERE expires_at <= unixepoch();")
+        .execute(&state.db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to cleanup da oauth states: {err}")))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO da_oauth_states (state, user_id, return_to, created_at, expires_at)
+        VALUES (?1, ?2, ?3, unixepoch(), unixepoch() + 600);
+        "#,
+    )
+    .bind(&state_token)
+    .bind(auth.user_id)
+    .bind(&return_to)
+    .execute(&state.db)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to create da oauth state: {err}")))?;
+
+    let mut auth_url = reqwest::Url::parse("https://www.donationalerts.com/oauth/authorize")
+        .map_err(|err| AppError::internal(format!("failed to build da oauth url: {err}")))?;
+    auth_url
+        .query_pairs_mut()
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("response_type", "code")
+        .append_pair(
+            "scope",
+            "oauth-user-show oauth-donation-index oauth-donation-subscribe",
+        )
+        .append_pair("state", &state_token);
+
+    Ok(Redirect::to(auth_url.as_ref()))
+}
+
+async fn da_oauth_callback(
+    State(state): State<AppState>,
+    Query(query): Query<DonationAlertsOAuthCallbackQuery>,
+) -> Result<Redirect, AppError> {
+    let client_id = state
+        .da_client_id
+        .as_deref()
+        .ok_or_else(|| AppError::internal("DA_CLIENT_ID is not configured"))?;
+    let client_secret = state
+        .da_client_secret
+        .as_deref()
+        .ok_or_else(|| AppError::internal("DA_CLIENT_SECRET is not configured"))?;
+    let redirect_uri = state
+        .da_redirect_uri
+        .as_deref()
+        .ok_or_else(|| AppError::internal("DA_REDIRECT_URI is not configured"))?;
+
+    let Some(state_token) = query.state.as_deref() else {
+        return Ok(Redirect::to("/#da_oauth_error=missing_state"));
+    };
+
+    let (owner_user_id, return_to) = match consume_da_oauth_state(&state.db, state_token).await {
+        Ok(payload) => payload,
+        Err(_) => return Ok(Redirect::to("/#da_oauth_error=invalid_state")),
+    };
+
+    if let Some(error) = query.error.as_deref() {
+        let safe = if error.is_empty() {
+            "oauth_denied"
+        } else {
+            "oauth_provider_error"
+        };
+        tracing::warn!(da_error = %error, "donationalerts oauth callback returned error");
+        return Ok(redirect_with_fragment(
+            &return_to,
+            "da_oauth_error",
+            Some(safe),
+        ));
+    }
+
+    let Some(code) = query.code.as_deref() else {
+        return Ok(redirect_with_fragment(
+            &return_to,
+            "da_oauth_error",
+            Some("missing_authorization_code"),
+        ));
+    };
+
+    let token_response = state
+        .http
+        .post("https://www.donationalerts.com/oauth/token")
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("redirect_uri", redirect_uri),
+            ("code", code),
+        ])
+        .send()
+        .await
+        .map_err(|err| {
+            AppError::internal(format!("donationalerts token exchange failed: {err}"))
+        })?;
+
+    if !token_response.status().is_success() {
+        tracing::warn!(
+            status = %token_response.status(),
+            "donationalerts token exchange returned non-success"
+        );
+        return Ok(redirect_with_fragment(
+            &return_to,
+            "da_oauth_error",
+            Some("oauth_token_exchange_failed"),
+        ));
+    }
+
+    let token_payload: DonationAlertsTokenResponse =
+        token_response.json().await.map_err(|err| {
+            AppError::internal(format!("invalid donationalerts token response: {err}"))
+        })?;
+
+    let userinfo_response = state
+        .http
+        .get("https://www.donationalerts.com/api/v1/user/oauth")
+        .bearer_auth(&token_payload.access_token)
+        .send()
+        .await
+        .map_err(|err| AppError::internal(format!("donationalerts user request failed: {err}")))?;
+
+    if !userinfo_response.status().is_success() {
+        tracing::warn!(
+            status = %userinfo_response.status(),
+            "donationalerts user oauth returned non-success"
+        );
+        return Ok(redirect_with_fragment(
+            &return_to,
+            "da_oauth_error",
+            Some("oauth_userinfo_failed"),
+        ));
+    }
+
+    let da_user_payload: DonationAlertsUserOauthResponse =
+        userinfo_response.json().await.map_err(|err| {
+            AppError::internal(format!("invalid donationalerts user response: {err}"))
+        })?;
+
+    let refresh_token = token_payload
+        .refresh_token
+        .as_deref()
+        .ok_or_else(|| AppError::internal("donationalerts token response missing refresh_token"))?;
+    let token_expires_at = now_unix() + token_payload.expires_in.unwrap_or(3600).max(60) - 30;
+    let scope = token_payload.scope.unwrap_or_else(|| {
+        "oauth-user-show oauth-donation-index oauth-donation-subscribe".to_string()
+    });
+
+    sqlx::query(
+        r#"
+        INSERT INTO da_integrations (
+            owner_user_id, da_user_id, access_token, refresh_token, token_expires_at, scope,
+            last_seen_external_id, last_sync_at, last_error, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, unixepoch(), unixepoch())
+        ON CONFLICT(owner_user_id) DO UPDATE
+        SET da_user_id = excluded.da_user_id,
+            access_token = excluded.access_token,
+            refresh_token = excluded.refresh_token,
+            token_expires_at = excluded.token_expires_at,
+            scope = excluded.scope,
+            last_error = NULL,
+            updated_at = unixepoch();
+        "#,
+    )
+    .bind(owner_user_id)
+    .bind(da_user_payload.data.id)
+    .bind(&token_payload.access_token)
+    .bind(refresh_token)
+    .bind(token_expires_at)
+    .bind(&scope)
+    .execute(&state.db)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to upsert da integration: {err}")))?;
+
+    let target_session_id = if let Some(session_code) = session_code_from_return_to(&return_to) {
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT id
+            FROM stream_sessions
+            WHERE owner_user_id = ?1
+              AND public_code = ?2
+              AND is_active = 1
+            LIMIT 1;
+            "#,
+        )
+        .bind(owner_user_id)
+        .bind(session_code)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|err| {
+            AppError::internal(format!(
+                "failed to resolve target session for da oauth: {err}"
+            ))
+        })?
+    } else {
+        None
+    };
+
+    let fallback_external_id: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(last_seen_external_id, 0)
+        FROM da_integrations
+        WHERE owner_user_id = ?1
+        LIMIT 1;
+        "#,
+    )
+    .bind(owner_user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to read donation baseline fallback: {err}")))?
+    .unwrap_or(0)
+    .max(0);
+
+    let baseline_external_id =
+        match fetch_latest_donation_external_id(&state.http, &token_payload.access_token).await {
+            Ok(latest) => latest.max(fallback_external_id),
+            Err(err) => {
+                tracing::warn!(
+                    owner_user_id,
+                    "failed to fetch donation baseline after da oauth connect: {err}"
+                );
+                fallback_external_id
+            }
+        };
+
+    if let Some(session_id) = target_session_id {
+        sqlx::query(
+            r#"
+            UPDATE stream_sessions
+            SET donations_enabled = CASE WHEN id = ?3 THEN 1 ELSE 0 END,
+                donations_enabled_at = CASE
+                    WHEN id = ?3 THEN COALESCE(donations_enabled_at, unixepoch())
+                    ELSE NULL
+                END,
+                donations_min_external_id = CASE
+                    WHEN id = ?3 THEN CASE
+                        WHEN donations_min_external_id IS NULL THEN ?2
+                        WHEN donations_min_external_id < ?2 THEN ?2
+                        ELSE donations_min_external_id
+                    END
+                    ELSE NULL
+                END
+            WHERE owner_user_id = ?1
+              AND is_active = 1;
+            "#,
+        )
+        .bind(owner_user_id)
+        .bind(baseline_external_id)
+        .bind(session_id)
+        .execute(&state.db)
+        .await
+        .map_err(|err| {
+            AppError::internal(format!(
+                "failed to bind da integration to target session: {err}"
+            ))
+        })?;
+    } else {
+        sqlx::query(
+            r#"
+            UPDATE stream_sessions
+            SET donations_enabled_at = COALESCE(donations_enabled_at, unixepoch()),
+                donations_min_external_id = CASE
+                    WHEN donations_min_external_id IS NULL THEN ?2
+                    WHEN donations_min_external_id < ?2 THEN ?2
+                    ELSE donations_min_external_id
+                END
+            WHERE owner_user_id = ?1
+              AND is_active = 1
+              AND donations_enabled = 1;
+            "#,
+        )
+        .bind(owner_user_id)
+        .bind(baseline_external_id)
+        .execute(&state.db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to align donation baseline: {err}")))?;
+    }
+
+    let active_session_ids = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT id
+        FROM stream_sessions
+        WHERE owner_user_id = ?1
+          AND is_active = 1;
+        "#,
+    )
+    .bind(owner_user_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to list active sessions: {err}")))?;
+    for session_id in active_session_ids {
+        state
+            .session_events
+            .publish(session_id, SessionEvent::resync())
+            .await;
+    }
+
+    tracing::info!(
+        owner_user_id,
+        da_user_id = da_user_payload.data.id,
+        "donationalerts oauth connected"
+    );
+
+    Ok(redirect_with_fragment(&return_to, "da_oauth", Some("ok")))
+}
+
+async fn get_da_integration_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<DonationIntegrationStatus>, AppError> {
+    let auth = require_auth_user(&state, &headers).await?;
+
+    let status = sqlx::query_as::<_, DonationIntegrationStatus>(
+        r#"
+        SELECT
+            1 AS connected,
+            da_user_id,
+            scope,
+            token_expires_at,
+            last_seen_external_id,
+            last_sync_at,
+            last_error
+        FROM da_integrations
+        WHERE owner_user_id = ?1
+        LIMIT 1;
+        "#,
+    )
+    .bind(auth.user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to load da integration: {err}")))?
+    .unwrap_or(DonationIntegrationStatus {
+        connected: 0,
+        da_user_id: None,
+        scope: None,
+        token_expires_at: None,
+        last_seen_external_id: None,
+        last_sync_at: None,
+        last_error: None,
+    });
+
+    Ok(Json(status))
+}
+
+async fn disconnect_da_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, AppError> {
+    let auth = require_auth_user(&state, &headers).await?;
+
+    let session_ids = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT id
+        FROM stream_sessions
+        WHERE owner_user_id = ?1;
+        "#,
+    )
+    .bind(auth.user_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to list owner sessions: {err}")))?;
+
+    sqlx::query("DELETE FROM da_integrations WHERE owner_user_id = ?1;")
+        .bind(auth.user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to disconnect da integration: {err}")))?;
+
+    sqlx::query("DELETE FROM donations WHERE owner_user_id = ?1;")
+        .bind(auth.user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to delete donation history: {err}")))?;
+
+    sqlx::query(
+        r#"
+        UPDATE stream_sessions
+        SET donations_enabled = 0,
+            donations_enabled_at = NULL,
+            donations_min_external_id = NULL
+        WHERE owner_user_id = ?1;
+        "#,
+    )
+    .bind(auth.user_id)
+    .execute(&state.db)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to reset donation session state: {err}")))?;
+
+    for session_id in session_ids {
+        state
+            .session_events
+            .publish(session_id, SessionEvent::resync())
+            .await;
+    }
+
+    tracing::info!(
+        owner_user_id = auth.user_id,
+        "donationalerts integration disconnected"
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_user_sessions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -791,7 +1444,10 @@ async fn list_user_sessions(
             description,
             stream_link,
             stopped_at,
-            downvote_threshold
+            downvote_threshold,
+            donations_enabled,
+            donations_enabled_at,
+            donations_min_external_id
         FROM stream_sessions
         WHERE owner_user_id = ?1
         ORDER BY created_at DESC;
@@ -862,13 +1518,65 @@ async fn create_session(
         .map(|t| t.clamp(1, 1000))
         .unwrap_or(5);
 
+    let has_active_donation_session: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT id
+        FROM stream_sessions
+        WHERE owner_user_id = ?1
+          AND is_active = 1
+          AND donations_enabled = 1
+        LIMIT 1;
+        "#,
+    )
+    .bind(auth.user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| {
+        AppError::internal(format!("failed to check donation-enabled sessions: {err}"))
+    })?;
+
+    let donations_enabled_default = if has_active_donation_session.is_some() {
+        0
+    } else {
+        1
+    };
+    let (donations_enabled_at_default, donations_min_external_id_default) =
+        if donations_enabled_default == 1 {
+            let baseline = match resolve_donation_baseline_for_owner(&state, auth.user_id).await {
+                Ok(value) => value.max(0),
+                Err(err) => {
+                    tracing::warn!(
+                        user_id = auth.user_id,
+                        error = ?err,
+                        "failed to resolve donation baseline for new session, falling back to 0"
+                    );
+                    0
+                }
+            };
+            (Some(now_unix()), Some(baseline))
+        } else {
+            (None, None)
+        };
+
     let mut inserted_id: Option<i64> = None;
     for _ in 0..8 {
         let public_code = generate_session_code();
         let res = sqlx::query(
             r#"
-            INSERT INTO stream_sessions (owner_user_id, public_code, created_at, is_active, name, description, stream_link, downvote_threshold)
-            VALUES (?1, ?2, unixepoch(), 1, ?3, ?4, ?5, ?6);
+            INSERT INTO stream_sessions (
+                owner_user_id,
+                public_code,
+                created_at,
+                is_active,
+                name,
+                description,
+                stream_link,
+                downvote_threshold,
+                donations_enabled,
+                donations_enabled_at,
+                donations_min_external_id
+            )
+            VALUES (?1, ?2, unixepoch(), 1, ?3, ?4, ?5, ?6, ?7, ?8, ?9);
             "#,
         )
         .bind(auth.user_id)
@@ -877,6 +1585,9 @@ async fn create_session(
         .bind(&description)
         .bind(&stream_link)
         .bind(downvote_threshold)
+        .bind(donations_enabled_default)
+        .bind(donations_enabled_at_default)
+        .bind(donations_min_external_id_default)
         .execute(&state.db)
         .await;
 
@@ -909,7 +1620,10 @@ async fn create_session(
             description,
             stream_link,
             stopped_at,
-            downvote_threshold
+            downvote_threshold,
+            donations_enabled,
+            donations_enabled_at,
+            donations_min_external_id
         FROM stream_sessions
         WHERE id = ?1;
         "#,
@@ -943,7 +1657,7 @@ async fn list_questions(
         ));
     }
 
-    let questions = list_questions_for_session(
+    let questions = list_feed_items_for_session(
         &state.db,
         session.id,
         sort,
@@ -1033,8 +1747,9 @@ async fn session_events_handler(
     // Emit one event immediately so clients can transition to "live" without
     // waiting for the first keepalive tick or a new question event.
     let initial_stream = tokio_stream::iter([Ok(Event::default().data(
-        serde_json::to_string(&SessionEvent::resync())
-            .unwrap_or_else(|_| r#"{"kind":"resync","question_id":null}"#.to_string()),
+        serde_json::to_string(&SessionEvent::resync()).unwrap_or_else(|_| {
+            r#"{"kind":"resync","question_id":null,"donation_id":null}"#.to_string()
+        }),
     ))]);
     let stream = initial_stream.chain(live_stream);
 
@@ -1477,6 +2192,12 @@ async fn moderate_question(
                       WHERE other.session_id = ?5
                         AND other.status = ?2
                         AND other.id != ?1
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM donations other
+                      WHERE other.session_id = ?5
+                        AND other.status = ?2
                   );
                 "#,
             )
@@ -1492,31 +2213,15 @@ async fn moderate_question(
             })?;
 
             if update.rows_affected() == 0 {
-                let another_answering_exists = sqlx::query_scalar::<_, i64>(
-                    r#"
-                    SELECT 1
-                    FROM questions
-                    WHERE session_id = ?1
-                      AND status = ?2
-                      AND id != ?3
-                    LIMIT 1;
-                    "#,
+                if let Some(message) = current_answering_conflict_message(
+                    &state.db,
+                    meta.session_id,
+                    Some(question_id),
+                    None,
                 )
-                .bind(meta.session_id)
-                .bind(QuestionStatus::Answering.as_str())
-                .bind(question_id)
-                .fetch_optional(&state.db)
-                .await
-                .map_err(|err| {
-                    AppError::internal(format!(
-                        "failed to verify in-progress question uniqueness: {err}"
-                    ))
-                })?;
-
-                if another_answering_exists.is_some() {
-                    return Err(AppError::bad_request(
-                        "another question is already being answered in this session",
-                    ));
+                .await?
+                {
+                    return Err(AppError::bad_request(message));
                 }
 
                 return Err(AppError::bad_request(
@@ -1781,6 +2486,285 @@ async fn moderate_question(
     }
 }
 
+async fn moderate_donation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(donation_id): Path<i64>,
+    Json(payload): Json<ModerateDonationRequest>,
+) -> Result<Json<ModerateDonationResponse>, AppError> {
+    let auth = require_auth_user(&state, &headers).await?;
+
+    let meta = sqlx::query_as::<_, DonationAdminMeta>(
+        r#"
+        SELECT
+            s.id AS session_id,
+            s.owner_user_id,
+            s.is_active AS session_is_active
+        FROM donations d
+        JOIN stream_sessions s ON s.id = d.session_id
+        WHERE d.id = ?1
+        LIMIT 1;
+        "#,
+    )
+    .bind(donation_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to load donation metadata: {err}")))?
+    .ok_or_else(|| AppError::not_found("donation not found"))?;
+
+    if meta.owner_user_id != auth.user_id {
+        return Err(AppError::forbidden(
+            "only session owner can moderate donations",
+        ));
+    }
+
+    let action = payload.action;
+    if meta.session_is_active == 0
+        && matches!(
+            action,
+            ModerateDonationAction::Answer
+                | ModerateDonationAction::FinishAnswering
+                | ModerateDonationAction::Reject
+                | ModerateDonationAction::Reopen
+        )
+    {
+        return Err(AppError::forbidden(
+            "session is stopped: only delete is allowed",
+        ));
+    }
+
+    match action {
+        ModerateDonationAction::Answer => {
+            let update = sqlx::query(
+                r#"
+                UPDATE donations
+                SET status = ?2,
+                    answering_started_at = unixepoch(),
+                    answered_at = NULL
+                WHERE id = ?1
+                  AND status IN (?3, ?4)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM donations other
+                      WHERE other.session_id = ?5
+                        AND other.status = ?2
+                        AND other.id != ?1
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM questions other
+                      WHERE other.session_id = ?5
+                        AND other.status = ?2
+                  );
+                "#,
+            )
+            .bind(donation_id)
+            .bind(QuestionStatus::Answering.as_str())
+            .bind(QuestionStatus::New.as_str())
+            .bind(QuestionStatus::Rejected.as_str())
+            .bind(meta.session_id)
+            .execute(&state.db)
+            .await
+            .map_err(|err| {
+                AppError::internal(format!("failed to mark donation answering: {err}"))
+            })?;
+
+            if update.rows_affected() == 0 {
+                if let Some(message) = current_answering_conflict_message(
+                    &state.db,
+                    meta.session_id,
+                    None,
+                    Some(donation_id),
+                )
+                .await?
+                {
+                    return Err(AppError::bad_request(message));
+                }
+
+                return Err(AppError::bad_request("cannot mark donation as in-progress"));
+            }
+
+            let donation = fetch_donation_by_id(&state.db, donation_id).await?;
+            state
+                .session_events
+                .publish(meta.session_id, SessionEvent::donation_changed(donation_id))
+                .await;
+
+            Ok(Json(ModerateDonationResponse {
+                donation_id,
+                deleted: false,
+                donation: Some(donation),
+            }))
+        }
+        ModerateDonationAction::FinishAnswering => {
+            let update = sqlx::query(
+                r#"
+                UPDATE donations
+                SET status = ?2,
+                    answered_at = unixepoch()
+                WHERE id = ?1 AND status = ?3;
+                "#,
+            )
+            .bind(donation_id)
+            .bind(QuestionStatus::Answered.as_str())
+            .bind(QuestionStatus::Answering.as_str())
+            .execute(&state.db)
+            .await
+            .map_err(|err| {
+                AppError::internal(format!("failed to mark donation as answered: {err}"))
+            })?;
+
+            if update.rows_affected() == 0 {
+                return Err(AppError::bad_request(
+                    "donation is not in progress of answering",
+                ));
+            }
+
+            let donation = fetch_donation_by_id(&state.db, donation_id).await?;
+            state
+                .session_events
+                .publish(meta.session_id, SessionEvent::donation_changed(donation_id))
+                .await;
+
+            Ok(Json(ModerateDonationResponse {
+                donation_id,
+                deleted: false,
+                donation: Some(donation),
+            }))
+        }
+        ModerateDonationAction::Reject => {
+            let update = sqlx::query(
+                r#"
+                UPDATE donations
+                SET status = ?2,
+                    answering_started_at = NULL,
+                    answered_at = NULL
+                WHERE id = ?1 AND status IN (?3, ?4);
+                "#,
+            )
+            .bind(donation_id)
+            .bind(QuestionStatus::Rejected.as_str())
+            .bind(QuestionStatus::New.as_str())
+            .bind(QuestionStatus::Answering.as_str())
+            .execute(&state.db)
+            .await
+            .map_err(|err| AppError::internal(format!("failed to reject donation: {err}")))?;
+
+            if update.rows_affected() == 0 {
+                return Err(AppError::bad_request(
+                    "cannot reject: donation is already answered or rejected",
+                ));
+            }
+
+            let donation = fetch_donation_by_id(&state.db, donation_id).await?;
+            state
+                .session_events
+                .publish(meta.session_id, SessionEvent::donation_changed(donation_id))
+                .await;
+
+            Ok(Json(ModerateDonationResponse {
+                donation_id,
+                deleted: false,
+                donation: Some(donation),
+            }))
+        }
+        ModerateDonationAction::Delete => {
+            sqlx::query(
+                r#"
+                UPDATE donations
+                SET status = ?2
+                WHERE id = ?1 AND status != ?2;
+                "#,
+            )
+            .bind(donation_id)
+            .bind(QuestionStatus::Deleted.as_str())
+            .execute(&state.db)
+            .await
+            .map_err(|err| AppError::internal(format!("failed to delete donation: {err}")))?;
+
+            state
+                .session_events
+                .publish(meta.session_id, SessionEvent::donation_deleted(donation_id))
+                .await;
+
+            Ok(Json(ModerateDonationResponse {
+                donation_id,
+                deleted: true,
+                donation: None,
+            }))
+        }
+        ModerateDonationAction::Restore => {
+            let update = sqlx::query(
+                r#"
+                UPDATE donations
+                SET status = ?2,
+                    answering_started_at = NULL,
+                    answered_at = NULL
+                WHERE id = ?1 AND status = ?3;
+                "#,
+            )
+            .bind(donation_id)
+            .bind(QuestionStatus::New.as_str())
+            .bind(QuestionStatus::Deleted.as_str())
+            .execute(&state.db)
+            .await
+            .map_err(|err| AppError::internal(format!("failed to restore donation: {err}")))?;
+
+            if update.rows_affected() == 0 {
+                return Err(AppError::bad_request("donation is not deleted"));
+            }
+
+            let donation = fetch_donation_by_id(&state.db, donation_id).await?;
+            state
+                .session_events
+                .publish(meta.session_id, SessionEvent::donation_changed(donation_id))
+                .await;
+
+            Ok(Json(ModerateDonationResponse {
+                donation_id,
+                deleted: false,
+                donation: Some(donation),
+            }))
+        }
+        ModerateDonationAction::Reopen => {
+            let update = sqlx::query(
+                r#"
+                UPDATE donations
+                SET status = ?2,
+                    answering_started_at = NULL,
+                    answered_at = NULL
+                WHERE id = ?1 AND status IN (?3, ?4);
+                "#,
+            )
+            .bind(donation_id)
+            .bind(QuestionStatus::New.as_str())
+            .bind(QuestionStatus::Answering.as_str())
+            .bind(QuestionStatus::Answered.as_str())
+            .execute(&state.db)
+            .await
+            .map_err(|err| AppError::internal(format!("failed to reopen donation: {err}")))?;
+
+            if update.rows_affected() == 0 {
+                return Err(AppError::bad_request(
+                    "donation is not in answering or answered state",
+                ));
+            }
+
+            let donation = fetch_donation_by_id(&state.db, donation_id).await?;
+            state
+                .session_events
+                .publish(meta.session_id, SessionEvent::donation_changed(donation_id))
+                .await;
+
+            Ok(Json(ModerateDonationResponse {
+                donation_id,
+                deleted: false,
+                donation: Some(donation),
+            }))
+        }
+    }
+}
+
 async fn stop_session(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1798,7 +2782,13 @@ async fn stop_session(
     }
 
     sqlx::query(
-        "UPDATE stream_sessions SET is_active = 0, stopped_at = unixepoch() WHERE id = ?1;",
+        "UPDATE stream_sessions
+         SET is_active = 0,
+             stopped_at = unixepoch(),
+             donations_enabled = 0,
+             donations_enabled_at = NULL,
+             donations_min_external_id = NULL
+         WHERE id = ?1;",
     )
     .bind(session.id)
     .execute(&state.db)
@@ -1908,24 +2898,127 @@ async fn update_session(
         .map(|t| t.clamp(1, 1000))
         .unwrap_or(session.downvote_threshold);
 
+    let mut donations_enabled = session.donations_enabled;
+    let mut donations_enabled_at = session.donations_enabled_at;
+    let mut donations_min_external_id = session.donations_min_external_id;
+    let mut donations_routing_changed = false;
+
+    if let Some(enable_donations) = payload.donations_enabled {
+        let next_value = if enable_donations { 1 } else { 0 };
+        if next_value != session.donations_enabled {
+            if next_value == 1 {
+                if session.is_active == 0 {
+                    return Err(AppError::forbidden(
+                        "cannot enable donations for a stopped session",
+                    ));
+                }
+
+                let baseline_external_id: i64 = sqlx::query_scalar(
+                    r#"
+                    SELECT COALESCE(last_seen_external_id, 0)
+                    FROM da_integrations
+                    WHERE owner_user_id = ?1
+                    LIMIT 1;
+                    "#,
+                )
+                .bind(auth.user_id)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|err| {
+                    AppError::internal(format!("failed to resolve donation baseline: {err}"))
+                })?
+                .unwrap_or(0)
+                .max(0);
+                donations_enabled = 1;
+                donations_enabled_at = Some(now_unix());
+                donations_min_external_id = Some(baseline_external_id.max(0));
+            } else {
+                donations_enabled = 0;
+                donations_enabled_at = None;
+                donations_min_external_id = None;
+            }
+
+            donations_routing_changed = true;
+        }
+    }
+
+    if donations_routing_changed && donations_enabled == 1 {
+        sqlx::query(
+            r#"
+            UPDATE stream_sessions
+            SET donations_enabled = 0,
+                donations_enabled_at = NULL,
+                donations_min_external_id = NULL
+            WHERE owner_user_id = ?1
+              AND id != ?2;
+            "#,
+        )
+        .bind(auth.user_id)
+        .bind(session.id)
+        .execute(&state.db)
+        .await
+        .map_err(|err| {
+            AppError::internal(format!(
+                "failed to disable donations for other sessions: {err}"
+            ))
+        })?;
+    }
+
     sqlx::query(
         r#"
         UPDATE stream_sessions
-        SET name = ?1, description = ?2, stream_link = ?3, downvote_threshold = ?4
-        WHERE id = ?5;
+        SET name = ?1,
+            description = ?2,
+            stream_link = ?3,
+            downvote_threshold = ?4,
+            donations_enabled = ?5,
+            donations_enabled_at = ?6,
+            donations_min_external_id = ?7
+        WHERE id = ?8;
         "#,
     )
     .bind(&name)
     .bind(&description)
     .bind(&stream_link)
     .bind(downvote_threshold)
+    .bind(donations_enabled)
+    .bind(donations_enabled_at)
+    .bind(donations_min_external_id)
     .bind(session.id)
     .execute(&state.db)
     .await
     .map_err(|err| AppError::internal(format!("failed to update session: {err}")))?;
 
-    tracing::info!(session_id = session.id, %name, downvote_threshold, "session metadata updated");
+    tracing::info!(
+        session_id = session.id,
+        %name,
+        downvote_threshold,
+        donations_enabled,
+        "session metadata updated"
+    );
     let updated = find_session_by_code(&state.db, &code).await?;
+
+    if donations_routing_changed {
+        let session_ids = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT id
+            FROM stream_sessions
+            WHERE owner_user_id = ?1;
+            "#,
+        )
+        .bind(auth.user_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to list owner sessions: {err}")))?;
+
+        for session_id in session_ids {
+            state
+                .session_events
+                .publish(session_id, SessionEvent::resync())
+                .await;
+        }
+    }
+
     Ok(Json(updated))
 }
 
@@ -1997,6 +3090,10 @@ async fn optional_auth_user_id(state: &AppState, headers: &HeaderMap) -> Option<
 async fn require_auth_user(state: &AppState, headers: &HeaderMap) -> Result<AuthUser, AppError> {
     let token = extract_bearer_token(headers)
         .ok_or_else(|| AppError::unauthorized("missing bearer token"))?;
+    require_auth_user_by_token(state, &token).await
+}
+
+async fn require_auth_user_by_token(state: &AppState, token: &str) -> Result<AuthUser, AppError> {
     let token_hash = hash_token(&token);
 
     let auth_user = sqlx::query_as::<_, AuthUser>(
@@ -2043,7 +3140,10 @@ async fn find_session_by_code(db: &SqlitePool, code: &str) -> Result<StreamSessi
             description,
             stream_link,
             stopped_at,
-            downvote_threshold
+            downvote_threshold,
+            donations_enabled,
+            donations_enabled_at,
+            donations_min_external_id
         FROM stream_sessions
         WHERE public_code = ?1
         LIMIT 1;
@@ -2056,13 +3156,134 @@ async fn find_session_by_code(db: &SqlitePool, code: &str) -> Result<StreamSessi
     .ok_or_else(|| AppError::not_found("session not found"))
 }
 
-async fn list_questions_for_session(
+async fn list_feed_items_for_session(
     db: &SqlitePool,
     session_id: i64,
     sort: QuestionSort,
     viewer_user_id: Option<i64>,
     downvote_threshold: i64,
-) -> Result<Vec<QuestionView>, AppError> {
+) -> Result<Vec<FeedItemView>, AppError> {
+    let mut question_items =
+        list_question_items_for_session(db, session_id, sort, viewer_user_id, downvote_threshold)
+            .await?;
+
+    let mut donation_items = list_donation_items_for_session(db, session_id, sort).await?;
+
+    let combined = match sort {
+        QuestionSort::Top => {
+            donation_items.sort_by(|a, b| {
+                let a_usd = a.donation_usd_cents.unwrap_or(0);
+                let b_usd = b.donation_usd_cents.unwrap_or(0);
+                b_usd
+                    .cmp(&a_usd)
+                    .then_with(|| b.created_at.cmp(&a.created_at))
+            });
+            donation_items.append(&mut question_items);
+            pin_answering_question_first(&mut donation_items);
+            donation_items
+        }
+        QuestionSort::New => {
+            question_items.append(&mut donation_items);
+            question_items.sort_by(|a, b| {
+                b.created_at
+                    .cmp(&a.created_at)
+                    .then_with(|| b.id.cmp(&a.id))
+            });
+            pin_answering_question_first(&mut question_items);
+            question_items
+        }
+        QuestionSort::Answered => {
+            question_items.append(&mut donation_items);
+            question_items.sort_by(|a, b| {
+                let a_time = a.answered_at.unwrap_or(a.created_at);
+                let b_time = b.answered_at.unwrap_or(b.created_at);
+                b_time.cmp(&a_time).then_with(|| b.id.cmp(&a.id))
+            });
+            question_items
+        }
+        QuestionSort::Deleted => {
+            question_items.append(&mut donation_items);
+            question_items.sort_by(|a, b| {
+                b.created_at
+                    .cmp(&a.created_at)
+                    .then_with(|| b.id.cmp(&a.id))
+            });
+            question_items
+        }
+        QuestionSort::Downvoted => question_items,
+    };
+
+    Ok(combined)
+}
+
+async fn current_answering_conflict_message(
+    db: &SqlitePool,
+    session_id: i64,
+    exclude_question_id: Option<i64>,
+    exclude_donation_id: Option<i64>,
+) -> Result<Option<&'static str>, AppError> {
+    let conflicts = sqlx::query_as::<_, SessionAnsweringConflicts>(
+        r#"
+        SELECT
+            EXISTS(
+                SELECT 1
+                FROM questions q
+                WHERE q.session_id = ?1
+                  AND q.status = ?2
+                  AND (?3 IS NULL OR q.id != ?3)
+            ) AS has_question,
+            EXISTS(
+                SELECT 1
+                FROM donations d
+                WHERE d.session_id = ?1
+                  AND d.status = ?2
+                  AND (?4 IS NULL OR d.id != ?4)
+            ) AS has_donation;
+        "#,
+    )
+    .bind(session_id)
+    .bind(QuestionStatus::Answering.as_str())
+    .bind(exclude_question_id)
+    .bind(exclude_donation_id)
+    .fetch_one(db)
+    .await
+    .map_err(|err| {
+        AppError::internal(format!(
+            "failed to verify in-progress answer uniqueness: {err}"
+        ))
+    })?;
+
+    Ok(
+        match (conflicts.has_question != 0, conflicts.has_donation != 0) {
+            (true, true) => {
+                Some("another question or donation is already being answered in this session")
+            }
+            (true, false) => Some("another question is already being answered in this session"),
+            (false, true) => Some("a donation is already being answered in this session"),
+            (false, false) => None,
+        },
+    )
+}
+
+fn pin_answering_question_first(items: &mut Vec<FeedItemView>) {
+    if let Some(index) = items
+        .iter()
+        .position(|item| item.kind == "question" && item.is_answering != 0)
+    {
+        if index != 0 {
+            let item = items.remove(index);
+            items.insert(0, item);
+        }
+    }
+}
+
+async fn list_question_items_for_session(
+    db: &SqlitePool,
+    session_id: i64,
+    sort: QuestionSort,
+    viewer_user_id: Option<i64>,
+    downvote_threshold: i64,
+) -> Result<Vec<FeedItemView>, AppError> {
     let threshold = downvote_threshold.max(1);
     let status_new = QuestionStatus::New.as_str();
     let status_answering = QuestionStatus::Answering.as_str();
@@ -2108,9 +3329,12 @@ async fn list_questions_for_session(
     let sql = format!(
         r#"
         SELECT
-            q.id,
+            q.id AS id,
+            'question' AS kind,
+            q.id AS question_id,
+            NULL AS donation_id,
             q.session_id,
-            q.author_user_id,
+            q.author_user_id AS author_user_id,
             u.nickname AS author_nickname,
             EXISTS(
                 SELECT 1
@@ -2128,7 +3352,11 @@ async fn list_questions_for_session(
             (SELECT COUNT(*) FROM votes vv WHERE vv.question_id = q.id) AS votes_count,
             COALESCE(uv.value, 0) AS user_vote,
             q.answering_started_at,
-            q.answered_at
+            q.answered_at,
+            NULL AS donation_amount_minor,
+            NULL AS donation_currency,
+            NULL AS donation_usd_cents,
+            NULL AS donation_external_id
         FROM questions q
         JOIN stream_sessions s ON s.id = q.session_id
         JOIN users u ON u.id = q.author_user_id
@@ -2144,12 +3372,94 @@ async fn list_questions_for_session(
         status_deleted = status_deleted
     );
 
-    sqlx::query_as::<_, QuestionView>(&sql)
+    sqlx::query_as::<_, FeedItemView>(&sql)
         .bind(session_id)
         .bind(viewer_user_id.unwrap_or(-1))
         .fetch_all(db)
         .await
         .map_err(|err| AppError::internal(format!("failed to list questions: {err}")))
+}
+
+async fn list_donation_items_for_session(
+    db: &SqlitePool,
+    session_id: i64,
+    sort: QuestionSort,
+) -> Result<Vec<FeedItemView>, AppError> {
+    let status_new = QuestionStatus::New.as_str();
+    let status_answering = QuestionStatus::Answering.as_str();
+    let status_answered = QuestionStatus::Answered.as_str();
+    let status_rejected = QuestionStatus::Rejected.as_str();
+    let status_deleted = QuestionStatus::Deleted.as_str();
+
+    let (filter, order_by): (String, String) = match sort {
+        QuestionSort::Top => (
+            format!(
+                "WHERE d.session_id = ?1 AND d.status IN ('{status_new}', '{status_answering}')"
+            ),
+            "ORDER BY d.usd_cents DESC, d.created_at DESC".to_string(),
+        ),
+        QuestionSort::New => (
+            format!(
+                "WHERE d.session_id = ?1 AND d.status IN ('{status_new}', '{status_answering}')"
+            ),
+            "ORDER BY d.created_at DESC".to_string(),
+        ),
+        QuestionSort::Answered => (
+            format!(
+                "WHERE d.session_id = ?1 AND d.status IN ('{status_answered}', '{status_rejected}')"
+            ),
+            "ORDER BY COALESCE(d.answered_at, d.created_at) DESC".to_string(),
+        ),
+        QuestionSort::Downvoted => return Ok(Vec::new()),
+        QuestionSort::Deleted => (
+            format!("WHERE d.session_id = ?1 AND d.status = '{status_deleted}'"),
+            "ORDER BY d.created_at DESC".to_string(),
+        ),
+    };
+
+    let sql = format!(
+        r#"
+        SELECT
+            -d.id AS id,
+            'donation' AS kind,
+            NULL AS question_id,
+            d.id AS donation_id,
+            d.session_id,
+            NULL AS author_user_id,
+            d.donor_name AS author_nickname,
+            0 AS author_is_banned,
+            d.body,
+            (d.status = '{status_answering}') AS is_answering,
+            (d.status = '{status_answered}') AS is_answered,
+            (d.status = '{status_rejected}') AS is_rejected,
+            (d.status = '{status_deleted}') AS is_deleted,
+            d.created_at,
+            d.usd_cents AS score,
+            0 AS votes_count,
+            0 AS user_vote,
+            d.answering_started_at,
+            d.answered_at,
+            d.amount_minor AS donation_amount_minor,
+            d.currency AS donation_currency,
+            d.usd_cents AS donation_usd_cents,
+            d.external_donation_id AS donation_external_id
+        FROM donations d
+        {filter}
+        {order_by};
+        "#,
+        filter = filter,
+        order_by = order_by,
+        status_answering = status_answering,
+        status_answered = status_answered,
+        status_rejected = status_rejected,
+        status_deleted = status_deleted
+    );
+
+    sqlx::query_as::<_, FeedItemView>(&sql)
+        .bind(session_id)
+        .fetch_all(db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to list donations: {err}")))
 }
 
 async fn fetch_question_by_id(db: &SqlitePool, question_id: i64) -> Result<QuestionView, AppError> {
@@ -2196,6 +3506,637 @@ async fn fetch_question_by_id(db: &SqlitePool, question_id: i64) -> Result<Quest
         .await
         .map_err(|err| AppError::internal(format!("failed to fetch question: {err}")))?
         .ok_or_else(|| AppError::not_found("question not found"))
+}
+
+async fn fetch_donation_by_id(db: &SqlitePool, donation_id: i64) -> Result<DonationView, AppError> {
+    let status_answering = QuestionStatus::Answering.as_str();
+    let status_answered = QuestionStatus::Answered.as_str();
+    let status_rejected = QuestionStatus::Rejected.as_str();
+    let status_deleted = QuestionStatus::Deleted.as_str();
+
+    let sql = format!(
+        r#"
+        SELECT
+            d.id,
+            d.session_id,
+            d.owner_user_id,
+            d.external_donation_id,
+            d.donor_name,
+            d.body,
+            d.amount_minor,
+            d.currency,
+            d.usd_cents,
+            (d.status = '{status_answering}') AS is_answering,
+            (d.status = '{status_answered}') AS is_answered,
+            (d.status = '{status_rejected}') AS is_rejected,
+            (d.status = '{status_deleted}') AS is_deleted,
+            d.created_at,
+            d.answering_started_at,
+            d.answered_at
+        FROM donations d
+        WHERE d.id = ?1
+        LIMIT 1;
+        "#
+    );
+
+    sqlx::query_as::<_, DonationView>(&sql)
+        .bind(donation_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to fetch donation: {err}")))?
+        .ok_or_else(|| AppError::not_found("donation not found"))
+}
+
+async fn run_db_migrations(db: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            id TEXT PRIMARY KEY,
+            applied_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    let migration_id = "20260305_donations";
+    add_column_if_missing(
+        db,
+        "stream_sessions",
+        "donations_enabled",
+        "INTEGER NOT NULL DEFAULT 1 CHECK (donations_enabled IN (0, 1))",
+    )
+    .await?;
+    add_column_if_missing(db, "stream_sessions", "donations_enabled_at", "INTEGER").await?;
+    add_column_if_missing(
+        db,
+        "stream_sessions",
+        "donations_min_external_id",
+        "INTEGER",
+    )
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS da_oauth_states (
+            state TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            return_to TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            expires_at INTEGER NOT NULL
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_da_oauth_states_expires_at ON da_oauth_states(expires_at);",
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS da_integrations (
+            owner_user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            da_user_id INTEGER NOT NULL,
+            access_token TEXT NOT NULL,
+            refresh_token TEXT NOT NULL,
+            token_expires_at INTEGER NOT NULL,
+            scope TEXT NOT NULL,
+            last_seen_external_id INTEGER,
+            last_sync_at INTEGER,
+            last_error TEXT,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS donations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL REFERENCES stream_sessions(id) ON DELETE CASCADE,
+            owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            external_donation_id INTEGER NOT NULL,
+            donor_name TEXT NOT NULL,
+            body TEXT NOT NULL CHECK (length(body) <= 300),
+            amount_minor INTEGER NOT NULL,
+            currency TEXT NOT NULL,
+            usd_cents INTEGER NOT NULL,
+            provider_created_at TEXT,
+            status TEXT NOT NULL DEFAULT 'new'
+                CHECK (status IN ('new', 'answering', 'answered', 'rejected', 'deleted')),
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            answering_started_at INTEGER,
+            answered_at INTEGER,
+            UNIQUE(owner_user_id, external_donation_id)
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_donations_session_status_created ON donations(session_id, status, created_at DESC);",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_donations_owner_external ON donations(owner_user_id, external_donation_id DESC);",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_stream_sessions_owner_active_donations ON stream_sessions(owner_user_id, is_active, donations_enabled);",
+    )
+    .execute(db)
+    .await?;
+
+    mark_migration_applied(db, migration_id).await?;
+    Ok(())
+}
+
+async fn mark_migration_applied(db: &SqlitePool, id: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO schema_migrations (id, applied_at) VALUES (?1, unixepoch());",
+    )
+    .bind(id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn add_column_if_missing(
+    db: &SqlitePool,
+    table_name: &str,
+    column_name: &str,
+    column_sql: &str,
+) -> anyhow::Result<()> {
+    if column_exists(db, table_name, column_name).await? {
+        return Ok(());
+    }
+
+    let sql = format!("ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql};");
+    sqlx::query(&sql).execute(db).await?;
+    Ok(())
+}
+
+async fn column_exists(
+    db: &SqlitePool,
+    table_name: &str,
+    column_name: &str,
+) -> anyhow::Result<bool> {
+    let query = format!("PRAGMA table_info({table_name});");
+    let rows = sqlx::query(&query).fetch_all(db).await?;
+    for row in rows {
+        let name: String = row.try_get("name")?;
+        if name == column_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn donation_sync_loop(state: AppState) {
+    if state.da_client_id.is_none()
+        || state.da_client_secret.is_none()
+        || state.da_redirect_uri.is_none()
+    {
+        tracing::info!("donation sync loop disabled: DA OAuth is not configured");
+        return;
+    }
+
+    loop {
+        if let Err(err) = sync_donations_once(&state).await {
+            tracing::warn!("donation sync loop failed: {err}");
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+async fn sync_donations_once(state: &AppState) -> anyhow::Result<()> {
+    let owners = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT DISTINCT di.owner_user_id
+        FROM da_integrations di
+        JOIN stream_sessions s
+          ON s.owner_user_id = di.owner_user_id
+         AND s.is_active = 1
+         AND s.donations_enabled = 1;
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    for owner_user_id in owners {
+        if let Err(err) = sync_owner_donations(state, owner_user_id).await {
+            tracing::warn!(owner_user_id, "failed to sync donations: {err}");
+            let _ = sqlx::query(
+                r#"
+                UPDATE da_integrations
+                SET last_error = ?2, updated_at = unixepoch()
+                WHERE owner_user_id = ?1;
+                "#,
+            )
+            .bind(owner_user_id)
+            .bind(err.to_string())
+            .execute(&state.db)
+            .await;
+        }
+    }
+
+    Ok(())
+}
+
+async fn sync_owner_donations(state: &AppState, owner_user_id: i64) -> anyhow::Result<()> {
+    let session = sqlx::query_as::<_, DonationSyncSessionRow>(
+        r#"
+        SELECT
+            id AS session_id,
+            donations_min_external_id AS min_external_id
+        FROM stream_sessions
+        WHERE owner_user_id = ?1
+          AND is_active = 1
+          AND donations_enabled = 1
+        ORDER BY COALESCE(donations_enabled_at, created_at) DESC
+        LIMIT 1;
+        "#,
+    )
+    .bind(owner_user_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("no active donation-enabled session"))?;
+
+    let integration = sqlx::query_as::<_, DaIntegrationAuthRow>(
+        r#"
+        SELECT
+            owner_user_id,
+            da_user_id,
+            access_token,
+            refresh_token,
+            token_expires_at,
+            scope,
+            last_seen_external_id
+        FROM da_integrations
+        WHERE owner_user_id = ?1
+        LIMIT 1;
+        "#,
+    )
+    .bind(owner_user_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    let integration = ensure_da_access_token(state, integration).await?;
+    let baseline_id = session
+        .min_external_id
+        .unwrap_or(0)
+        .max(integration.last_seen_external_id.unwrap_or(0));
+
+    let donations =
+        fetch_donations_since(&state.http, &integration.access_token, baseline_id).await?;
+    let mut max_seen = baseline_id;
+
+    for donation in donations {
+        max_seen = max_seen.max(donation.id);
+        let donor_name = normalize_donation_name(donation.username.as_deref());
+        let body = normalize_donation_body(donation.message.as_deref());
+        let amount_minor = amount_to_minor(donation.amount);
+        let usd_cents = convert_amount_minor_to_usd_cents(amount_minor, &donation.currency);
+        let created_at = now_unix();
+
+        let insert = sqlx::query(
+            r#"
+            INSERT INTO donations (
+                session_id,
+                owner_user_id,
+                external_donation_id,
+                donor_name,
+                body,
+                amount_minor,
+                currency,
+                usd_cents,
+                provider_created_at,
+                status,
+                created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(owner_user_id, external_donation_id) DO NOTHING;
+            "#,
+        )
+        .bind(session.session_id)
+        .bind(owner_user_id)
+        .bind(donation.id)
+        .bind(&donor_name)
+        .bind(&body)
+        .bind(amount_minor)
+        .bind(donation.currency.to_ascii_uppercase())
+        .bind(usd_cents)
+        .bind(donation.created_at.as_deref())
+        .bind(QuestionStatus::New.as_str())
+        .bind(created_at)
+        .execute(&state.db)
+        .await?;
+
+        if insert.rows_affected() > 0 {
+            state
+                .session_events
+                .publish(
+                    session.session_id,
+                    SessionEvent::donation_created(insert.last_insert_rowid()),
+                )
+                .await;
+        }
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE da_integrations
+        SET last_seen_external_id = ?2,
+            last_sync_at = unixepoch(),
+            last_error = NULL,
+            updated_at = unixepoch()
+        WHERE owner_user_id = ?1;
+        "#,
+    )
+    .bind(owner_user_id)
+    .bind(max_seen)
+    .execute(&state.db)
+    .await?;
+
+    Ok(())
+}
+
+async fn ensure_da_access_token(
+    state: &AppState,
+    integration: DaIntegrationAuthRow,
+) -> anyhow::Result<DaIntegrationAuthRow> {
+    if integration.token_expires_at > now_unix() + 60 {
+        return Ok(integration);
+    }
+
+    let client_id = state
+        .da_client_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("DA_CLIENT_ID is not configured"))?;
+    let client_secret = state
+        .da_client_secret
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("DA_CLIENT_SECRET is not configured"))?;
+
+    let response = state
+        .http
+        .post("https://www.donationalerts.com/oauth/token")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", integration.refresh_token.as_str()),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("scope", integration.scope.as_str()),
+        ])
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "donationalerts refresh token request failed with {}",
+            response.status()
+        ));
+    }
+
+    let refreshed: DonationAlertsTokenResponse = response.json().await?;
+    let new_refresh = refreshed
+        .refresh_token
+        .as_deref()
+        .unwrap_or(&integration.refresh_token);
+    let new_expires_at = now_unix() + refreshed.expires_in.unwrap_or(3600).max(60) - 30;
+    let new_scope = refreshed
+        .scope
+        .as_deref()
+        .unwrap_or(&integration.scope)
+        .to_string();
+
+    sqlx::query(
+        r#"
+        UPDATE da_integrations
+        SET access_token = ?2,
+            refresh_token = ?3,
+            token_expires_at = ?4,
+            scope = ?5,
+            updated_at = unixepoch()
+        WHERE owner_user_id = ?1;
+        "#,
+    )
+    .bind(integration.owner_user_id)
+    .bind(&refreshed.access_token)
+    .bind(new_refresh)
+    .bind(new_expires_at)
+    .bind(&new_scope)
+    .execute(&state.db)
+    .await?;
+
+    Ok(DaIntegrationAuthRow {
+        owner_user_id: integration.owner_user_id,
+        da_user_id: integration.da_user_id,
+        access_token: refreshed.access_token,
+        refresh_token: new_refresh.to_string(),
+        token_expires_at: new_expires_at,
+        scope: new_scope,
+        last_seen_external_id: integration.last_seen_external_id,
+    })
+}
+
+async fn resolve_donation_baseline_for_owner(
+    state: &AppState,
+    owner_user_id: i64,
+) -> Result<i64, AppError> {
+    let Some(integration) = sqlx::query_as::<_, DaIntegrationAuthRow>(
+        r#"
+        SELECT
+            owner_user_id,
+            da_user_id,
+            access_token,
+            refresh_token,
+            token_expires_at,
+            scope,
+            last_seen_external_id
+        FROM da_integrations
+        WHERE owner_user_id = ?1
+        LIMIT 1;
+        "#,
+    )
+    .bind(owner_user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to load da integration: {err}")))?
+    else {
+        return Ok(0);
+    };
+
+    let integration = ensure_da_access_token(state, integration)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to refresh da token: {err}")))?;
+
+    let fallback = integration.last_seen_external_id.unwrap_or(0).max(0);
+    match fetch_latest_donation_external_id(&state.http, &integration.access_token).await {
+        Ok(latest) => Ok(latest.max(fallback)),
+        Err(err) => {
+            tracing::warn!(
+                owner_user_id,
+                "failed to fetch donation baseline, using fallback: {err}"
+            );
+            Ok(fallback)
+        }
+    }
+}
+
+async fn fetch_latest_donation_external_id(
+    http: &Client,
+    access_token: &str,
+) -> anyhow::Result<i64> {
+    let response = http
+        .get("https://www.donationalerts.com/api/v1/alerts/donations")
+        .bearer_auth(access_token)
+        .query(&[("page", "1"), ("limit", "1")])
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "donationalerts donations request failed with {}",
+            response.status()
+        ));
+    }
+    let payload: DonationAlertsDonationsResponse = response.json().await?;
+    Ok(payload.data.into_iter().map(|d| d.id).max().unwrap_or(0))
+}
+
+async fn fetch_donations_since(
+    http: &Client,
+    access_token: &str,
+    baseline_external_id: i64,
+) -> anyhow::Result<Vec<DonationAlertsDonation>> {
+    let mut page = 1i64;
+    let limit = 100i64;
+    let max_pages = 20i64;
+    let mut collected = Vec::new();
+    let mut reached_known_id = false;
+
+    while page <= max_pages && !reached_known_id {
+        let response = http
+            .get("https://www.donationalerts.com/api/v1/alerts/donations")
+            .bearer_auth(access_token)
+            .query(&[("page", page.to_string()), ("limit", limit.to_string())])
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "donationalerts donations request failed with {}",
+                response.status()
+            ));
+        }
+
+        let payload: DonationAlertsDonationsResponse = response.json().await?;
+        if payload.data.is_empty() {
+            break;
+        }
+
+        let mut page_has_old = false;
+        for donation in payload.data {
+            if donation.id <= baseline_external_id {
+                page_has_old = true;
+                continue;
+            }
+            collected.push(donation);
+        }
+
+        if page_has_old {
+            reached_known_id = true;
+        }
+        page += 1;
+    }
+
+    collected.sort_by_key(|d| d.id);
+    Ok(collected)
+}
+
+fn amount_to_minor(amount: f64) -> i64 {
+    if !amount.is_finite() {
+        return 0;
+    }
+    let scaled = (amount * 100.0).round();
+    if scaled < i64::MIN as f64 {
+        i64::MIN
+    } else if scaled > i64::MAX as f64 {
+        i64::MAX
+    } else {
+        scaled as i64
+    }
+}
+
+fn convert_amount_minor_to_usd_cents(amount_minor: i64, currency: &str) -> i64 {
+    let rate = usd_rate_for_currency(currency).unwrap_or(1.0);
+    let raw = (amount_minor as f64 * rate).round();
+    if raw < i64::MIN as f64 {
+        i64::MIN
+    } else if raw > i64::MAX as f64 {
+        i64::MAX
+    } else {
+        raw as i64
+    }
+}
+
+fn usd_rate_for_currency(currency: &str) -> Option<f64> {
+    match currency.trim().to_ascii_uppercase().as_str() {
+        "USD" => Some(1.0),
+        "EUR" => Some(1.09),
+        "RUB" => Some(0.011),
+        "BYN" => Some(0.31),
+        "KZT" => Some(0.0021),
+        "UAH" => Some(0.024),
+        "BRL" => Some(0.20),
+        "TRY" => Some(0.031),
+        _ => None,
+    }
+}
+
+fn normalize_donation_name(raw: Option<&str>) -> String {
+    let trimmed = raw.unwrap_or("").trim();
+    if trimmed.is_empty() {
+        return "donor".to_string();
+    }
+
+    let mut out = String::new();
+    for ch in trimmed.chars().take(64) {
+        if ch.is_control() {
+            continue;
+        }
+        out.push(ch);
+    }
+
+    let final_name = out.trim();
+    if final_name.is_empty() {
+        "donor".to_string()
+    } else {
+        final_name.to_string()
+    }
+}
+
+fn normalize_donation_body(raw: Option<&str>) -> String {
+    let mut out = String::new();
+    let mut count = 0usize;
+    for ch in raw.unwrap_or("").chars() {
+        if count >= 300 {
+            break;
+        }
+        if ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t' {
+            continue;
+        }
+        out.push(ch);
+        count += 1;
+    }
+    out.trim().to_string()
 }
 
 async fn is_user_banned(
@@ -2330,6 +4271,41 @@ async fn consume_oauth_state(db: &SqlitePool, state_token: &str) -> Result<Strin
     return_to.ok_or_else(|| AppError::unauthorized("invalid or expired oauth state"))
 }
 
+async fn consume_da_oauth_state(
+    db: &SqlitePool,
+    state_token: &str,
+) -> Result<(i64, String), AppError> {
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|err| AppError::internal(format!("failed to start da oauth state tx: {err}")))?;
+
+    let row: Option<(i64, String)> = sqlx::query_as(
+        r#"
+        SELECT user_id, return_to
+        FROM da_oauth_states
+        WHERE state = ?1 AND expires_at > unixepoch()
+        LIMIT 1;
+        "#,
+    )
+    .bind(state_token)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|err| AppError::internal(format!("failed to read da oauth state: {err}")))?;
+
+    sqlx::query("DELETE FROM da_oauth_states WHERE state = ?1;")
+        .bind(state_token)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to consume da oauth state: {err}")))?;
+
+    tx.commit()
+        .await
+        .map_err(|err| AppError::internal(format!("failed to commit da oauth state tx: {err}")))?;
+
+    row.ok_or_else(|| AppError::unauthorized("invalid or expired da oauth state"))
+}
+
 fn sanitize_return_to(raw: Option<&str>) -> String {
     let candidate = raw.unwrap_or("/");
     if candidate.len() > 2048 {
@@ -2344,6 +4320,23 @@ fn sanitize_return_to(raw: Option<&str>) -> String {
         "/".to_string()
     } else {
         without_fragment.to_string()
+    }
+}
+
+fn session_code_from_return_to(return_to: &str) -> Option<&str> {
+    let path = return_to.split('?').next().unwrap_or(return_to);
+    let mut parts = path.split('/').filter(|segment| !segment.is_empty());
+    if parts.next()? != "s" {
+        return None;
+    }
+    let code = parts.next()?;
+    let valid = code
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+    if valid {
+        Some(code)
+    } else {
+        None
     }
 }
 

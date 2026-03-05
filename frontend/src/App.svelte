@@ -77,6 +77,7 @@
   let settingsBusy = false
   let settingsStatus = ''
   let settingsThreshold = 5
+  let settingsDonationsEnabled = false
   let stoppingSession = false
 
   // Timecodes panel (admin, ended session)
@@ -145,6 +146,10 @@
   let localVotes = {}
   let interactedQuestionIds = new Set()
   let hideInteracted = false
+  let hideDonations = false
+  let daIntegration = null
+  let daIntegrationLoading = false
+  let moderateDonationBusy = new Set()
 
   let eventSource = null
   let autoRefreshDebounceTimer = null
@@ -158,10 +163,15 @@
 
   const AUTO_REFRESH_DEBOUNCE_MS = 300
 
-  $: visibleQuestions =
-    hideInteracted && currentUser
-      ? questions.filter((question) => !interactedQuestionIds.has(question.id))
+  $: visibleQuestions = (() => {
+    let items = hideInteracted && currentUser
+      ? questions.filter(item => item.kind !== 'question' || !interactedQuestionIds.has(item.id))
       : questions
+    if (hideDonations && !admin) {
+      items = items.filter(item => item.kind !== 'donation')
+    }
+    return items
+  })()
 
   onMount(() => {
     void processOauthCallbackAndValidate()
@@ -202,6 +212,7 @@
     updateModeTouched = false
     pendingNewQuestions = 0
     hideInteracted = false
+    hideDonations = false
     interactedQuestionIds = new Set()
     showSessionSettings = false
     settingsStatus = ''
@@ -290,7 +301,7 @@
     let changed = false
     const next = new Set(interactedQuestionIds)
     for (const question of questions) {
-      if (question.author_user_id === currentUser.id && !next.has(question.id)) {
+      if (question.kind !== 'donation' && question.author_user_id === currentUser.id && !next.has(question.id)) {
         next.add(question.id)
         changed = true
       }
@@ -491,6 +502,21 @@
       clearHashFragment()
     }
 
+    const daOauth = hashParams.get('da_oauth')
+    const daOauthError = hashParams.get('da_oauth_error')
+    if (daOauth === 'ok') {
+      addNotification('DonationAlerts connected successfully.')
+      clearHashFragment()
+      if (route.name === 'session' && route.code) {
+        void refreshQuestions(route.code)
+      } else if (authToken) {
+        void fetchUserSessions()
+      }
+    } else if (daOauthError) {
+      addNotification(`DonationAlerts connection failed: ${daOauthError}`, 'error')
+      clearHashFragment()
+    }
+
     await validateStoredAuth()
   }
 
@@ -570,6 +596,7 @@
     }
     localVotes = {}
     hideInteracted = false
+    hideDonations = false
     loadInteractedQuestions(code, false)
     connectSessionEvents(code)
     await refreshQuestions(code)
@@ -847,8 +874,30 @@
     sessionData.is_active === 1 &&
     currentUser.id !== sessionData.owner_user_id &&
     !viewerIsBanned
-  $: activeAnsweringQuestionId =
-    questions.find((question) => question.is_answering === 1)?.id ?? null
+  $: activeAnsweringItem =
+    questions.find(item => (item.kind === 'question' || item.kind === 'donation') && item.is_answering === 1) ?? null
+
+  function hasOtherActiveAnsweringItem(kind, itemId) {
+    if (!activeAnsweringItem) {
+      return false
+    }
+
+    if (activeAnsweringItem.kind !== kind) {
+      return true
+    }
+
+    return kind === 'question'
+      ? activeAnsweringItem.id !== itemId
+      : activeAnsweringItem.donation_id !== itemId
+  }
+
+  function currentAnsweringConflictMessage() {
+    if (!activeAnsweringItem) {
+      return 'Finish the current in-progress item first.'
+    }
+
+    return `Finish the current in-progress ${activeAnsweringItem.kind} first.`
+  }
 
   async function moderateQuestion(questionId, action) {
     if (!authToken) {
@@ -861,8 +910,8 @@
       return
     }
 
-    if (action === 'answer' && activeAnsweringQuestionId !== null && activeAnsweringQuestionId !== questionId) {
-      addNotification('Finish the current in-progress question first.', 'error')
+    if (action === 'answer' && hasOtherActiveAnsweringItem('question', questionId)) {
+      addNotification(currentAnsweringConflictMessage(), 'error')
       return
     }
 
@@ -926,13 +975,16 @@
           name,
           description: settingsDescription.trim() || null,
           stream_link: settingsStreamLink.trim() || null,
-          downvote_threshold: Math.max(1, Math.min(1000, Math.round(Number(settingsThreshold) || 5)))
+          downvote_threshold: Math.max(1, Math.min(1000, Math.round(Number(settingsThreshold) || 5))),
+          donations_enabled: settingsDonationsEnabled
         }),
         auth: true
       })
       sessionData = payload
+      settingsDonationsEnabled = payload?.donations_enabled === 1
       settingsStatus = 'Settings saved.'
       showSessionSettings = false
+      void fetchUserSessions()
     } catch (error) {
       settingsStatus = error instanceof Error ? error.message : 'Failed to save settings.'
     } finally {
@@ -945,8 +997,10 @@
     settingsDescription = sessionData?.description ?? ''
     settingsStreamLink = sessionData?.stream_link ?? ''
     settingsThreshold = sessionData?.downvote_threshold ?? 5
+    settingsDonationsEnabled = sessionData?.donations_enabled === 1
     settingsStatus = ''
     showSessionSettings = true
+    void loadDaIntegration()
   }
 
   async function loadBans() {
@@ -1132,6 +1186,103 @@
       // silently ignore
     }
   }
+
+  function formatDonationMajor(amountMinor) {
+    const normalizedAmountMinor = typeof amountMinor === 'number' ? amountMinor : 0
+    const major = normalizedAmountMinor / 100
+    return major % 1 === 0 ? `${Math.round(major)}` : major.toFixed(2)
+  }
+
+  function formatDonationCurrency(currency) {
+    return currency ?? ''
+  }
+
+  function connectDonationAlerts() {
+    if (!authToken) {
+      addNotification('Login first to connect DonationAlerts.', 'error')
+      if (route.name === 'session') {
+        showSessionLogin = true
+      }
+      return
+    }
+
+    const returnTo = route.name === 'session' ? `/s/${route.code}` : '/'
+    const url = new URL(`${apiBase}/api/da/oauth/start`)
+    url.searchParams.set('return_to', returnTo)
+    url.searchParams.set('auth_token', authToken)
+    window.location.href = url.toString()
+  }
+
+  async function loadDaIntegration() {
+    daIntegrationLoading = true
+    try {
+      daIntegration = await apiRequest('/api/da/integration', { auth: true })
+    } catch {
+      daIntegration = null
+    } finally {
+      daIntegrationLoading = false
+    }
+  }
+
+  async function disconnectDonationAlerts() {
+    if (!authToken) {
+      addNotification('Login first to manage DonationAlerts.', 'error')
+      return
+    }
+
+    try {
+      await apiRequest('/api/da/integration', {
+        method: 'DELETE',
+        auth: true
+      })
+      addNotification('DonationAlerts disconnected. Stored donations were removed.')
+      await loadDaIntegration()
+      if (route.name === 'session') {
+        await refreshQuestions()
+      }
+    } catch (error) {
+      addNotification(error instanceof Error ? error.message : 'Failed to disconnect DonationAlerts.', 'error')
+    }
+  }
+
+  async function moderateDonation(donationId, action) {
+    if (!authToken) { addNotification('Login first.', 'error'); return }
+    if (!admin) { addNotification('Only session owner can moderate.', 'error'); return }
+    if (action === 'answer' && hasOtherActiveAnsweringItem('donation', donationId)) {
+      addNotification(currentAnsweringConflictMessage(), 'error')
+      return
+    }
+
+    moderateDonationBusy.add(donationId)
+    moderateDonationBusy = new Set(moderateDonationBusy)
+
+    try {
+      const payload = await apiRequest(`/api/donations/${donationId}/moderate`, {
+        method: 'POST',
+        body: JSON.stringify({ action }),
+        auth: true
+      })
+
+      if (payload.deleted) {
+        addNotification('Donation deleted.')
+      } else if (payload.donation) {
+        const msgs = {
+          answer: 'Donation in progress.',
+          finish_answering: 'Donation answered.',
+          reject: 'Donation rejected.',
+          reopen: 'Donation reopened.',
+          restore: 'Donation restored.'
+        }
+        addNotification(msgs[action] ?? 'Donation updated.')
+      }
+      await refreshQuestions()
+    } catch (error) {
+      addNotification(error instanceof Error ? error.message : 'Moderation failed.', 'error')
+    } finally {
+      moderateDonationBusy.delete(donationId)
+      moderateDonationBusy = new Set(moderateDonationBusy)
+    }
+  }
 </script>
 
 <svelte:head>
@@ -1174,6 +1325,9 @@
                         <span class="badge badge-answering" style="font-size: 11px; padding: 1px 6px;">Active</span>
                       {:else}
                         <span class="badge badge-rejected" style="font-size: 11px; padding: 1px 6px;">Stopped</span>
+                      {/if}
+                      {#if session.donations_enabled === 1}
+                        <span class="badge" style="font-size: 11px; padding: 1px 6px; color: #c2410c; background: #fff7ed; border: 1px solid #fdba74;">Donations</span>
                       {/if}
                     </div>
                     {#if session.description}
@@ -1388,6 +1542,7 @@
                 bind:description={settingsDescription}
                 bind:streamLink={settingsStreamLink}
               />
+              <hr class="settings-separator" />
               <div>
                 <label for="settings-threshold" class="text-sm field-label">Hide questions below score</label>
                 <div class="flex-row-gap-sm">
@@ -1402,6 +1557,34 @@
                   <span class="text-sm text-secondary">Questions at −{settingsThreshold} or lower move to Bad tab</span>
                 </div>
               </div>
+              <div>
+                <p class="text-sm field-label" style="display: block; margin: 0 0 6px;">Donation routing</p>
+                {#if daIntegrationLoading}
+                  <p class="text-sm text-secondary" style="display: flex; align-items: center; gap: 6px; margin: 0;"><Spinner size={13} />Loading DonationAlerts status...</p>
+                {:else if daIntegration?.connected}
+                  {#if sessionData?.is_active === 1}
+                    <label class="toggle-label">
+                      <input type="checkbox" bind:checked={settingsDonationsEnabled} />
+                      Receive DonationAlerts in this session
+                    </label>
+                    <p class="text-sm text-secondary" style="margin: 6px 0 0;">
+                      {#if settingsDonationsEnabled}
+                        New donations will be appended to this session.
+                      {:else}
+                        New donations are currently routed to another active session.
+                      {/if}
+                    </p>
+                    {#if settingsDonationsEnabled !== (sessionData?.donations_enabled === 1)}
+                      <p class="text-sm text-secondary" style="margin: 4px 0 0;">Save settings to apply the donation routing change.</p>
+                    {/if}
+                  {:else}
+                    <p class="text-sm text-secondary" style="margin: 0;">Stopped sessions cannot receive new donations.</p>
+                  {/if}
+                {:else}
+                  <p class="text-sm text-secondary" style="margin: 0;">Connect DonationAlerts below before enabling donations for this session.</p>
+                {/if}
+              </div>
+              <hr class="settings-separator" />
               <div class="form-actions">
                 <button type="submit" class="btn btn-primary btn-sm" disabled={settingsBusy}>
                   {settingsBusy ? 'Saving...' : 'Save'}
@@ -1428,6 +1611,36 @@
 
             </div>
           </form>
+
+          <div class="section-divider">
+            <p class="text-sm" style="font-weight: 600; margin: 0 0 8px;">DonationAlerts</p>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+              {#if daIntegrationLoading}
+                <p class="text-sm text-secondary" style="display: flex; align-items: center; gap: 6px;"><Spinner size={13} />Loading...</p>
+              {:else if daIntegration?.connected}
+                <p class="text-sm text-secondary">DonationAlerts account connected as user #{daIntegration.da_user_id}.</p>
+                {#if sessionData?.donations_enabled === 1}
+                  <p class="text-sm text-secondary" style="margin: 0;">This session currently receives new donations.</p>
+                {:else if sessionData?.is_active === 1}
+                  <p class="text-sm text-secondary" style="margin: 0;">This session does not currently receive new donations. Turn on "Receive DonationAlerts in this session" above and save to move them here.</p>
+                {:else}
+                  <p class="text-sm text-secondary" style="margin: 0;">This stopped session cannot receive new donations.</p>
+                {/if}
+                <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                  <button type="button" class="btn btn-secondary btn-sm" on:click={connectDonationAlerts}>Reconnect account</button>
+                  <ConfirmButton
+                    class="btn btn-danger btn-sm"
+                    label="Disconnect"
+                    confirmLabel="Confirm disconnect"
+                    on:confirm={disconnectDonationAlerts}
+                  />
+                </div>
+              {:else}
+                <p class="text-sm text-secondary">Not connected. Connect to receive donations in real time.</p>
+                <button type="button" class="btn btn-secondary btn-sm" style="align-self: flex-start;" on:click={connectDonationAlerts}>Connect DonationAlerts</button>
+              {/if}
+            </div>
+          </div>
         </div>
       {/if}
 
@@ -1569,6 +1782,13 @@
           </label>
         {/if}
 
+        {#if !admin}
+          <label class="toggle-label">
+            <input type="checkbox" bind:checked={hideDonations} />
+            Hide donations
+          </label>
+        {/if}
+
         <div class="tab-bar">
           <button
             type="button"
@@ -1630,30 +1850,37 @@
         {/if}
 
         {#each visibleQuestions as item}
-          <article class="q-card" class:answering={item.is_answering === 1} class:answered={item.is_answered === 1} class:rejected={item.is_rejected === 1} class:new-highlight={item.id === newQuestionId}>
+          <article class="q-card" class:answering={item.is_answering === 1} class:answered={item.is_answered === 1} class:rejected={item.is_rejected === 1} class:new-highlight={item.id === newQuestionId} class:donation={item.kind === 'donation'}>
             <div class="q-vote-col" style={overlay ? 'justify-content: center;' : ''}>
-              {#if !overlay}
-              <button
-                type="button"
-                class="q-vote-btn"
-                class:upvoted={localVotes[item.id] === 1}
-                on:click={() => vote(item.id, localVotes[item.id] === 1 ? 0 : 1)}
-                disabled={!viewerCanInteract || voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1 || item.is_rejected === 1 || item.is_deleted === 1}
-                title="Upvote"
-              >&#9650;</button>
-              {/if}
+              {#if item.kind === 'donation'}
+                <span class="q-score q-donation-amount">
+                  <span class="q-donation-value">{formatDonationMajor(item.donation_amount_minor)}</span>
+                  <span class="q-donation-currency">{formatDonationCurrency(item.donation_currency)}</span>
+                </span>
+              {:else}
+                {#if !overlay}
+                <button
+                  type="button"
+                  class="q-vote-btn"
+                  class:upvoted={localVotes[item.id] === 1}
+                  on:click={() => vote(item.id, localVotes[item.id] === 1 ? 0 : 1)}
+                  disabled={!viewerCanInteract || voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1 || item.is_rejected === 1 || item.is_deleted === 1}
+                  title="Upvote"
+                >&#9650;</button>
+                {/if}
 
-              <span class="q-score">{item.score}</span>
+                <span class="q-score">{item.score}</span>
 
-              {#if !overlay}
-              <button
-                type="button"
-                class="q-vote-btn"
-                class:downvoted={localVotes[item.id] === -1}
-                on:click={() => vote(item.id, localVotes[item.id] === -1 ? 0 : -1)}
-                disabled={!viewerCanInteract || voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1 || item.is_rejected === 1 || item.is_deleted === 1}
-                title="Downvote"
-              >&#9660;</button>
+                {#if !overlay}
+                <button
+                  type="button"
+                  class="q-vote-btn"
+                  class:downvoted={localVotes[item.id] === -1}
+                  on:click={() => vote(item.id, localVotes[item.id] === -1 ? 0 : -1)}
+                  disabled={!viewerCanInteract || voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1 || item.is_rejected === 1 || item.is_deleted === 1}
+                  title="Downvote"
+                >&#9660;</button>
+                {/if}
               {/if}
             </div>
 
@@ -1674,8 +1901,13 @@
                 <span>{item.author_nickname}</span>
                 <span class="q-meta-sep">&middot;</span>
                 <span>{formatTime(item.created_at)}</span>
-                <span class="q-meta-sep">&middot;</span>
-                <span>{item.votes_count} vote{item.votes_count === 1 ? '' : 's'}</span>
+                {#if item.kind === 'donation'}
+                  <span class="q-meta-sep">&middot;</span>
+                  <span class="q-meta-donation-label">Donation</span>
+                {:else}
+                  <span class="q-meta-sep">&middot;</span>
+                  <span>{item.votes_count} vote{item.votes_count === 1 ? '' : 's'}</span>
+                {/if}
                 {#if item.is_answering === 1 && item.answering_started_at}
                   <span class="q-meta-sep">&middot;</span>
                   <span>answering for {formatDuration(nowUnix() - item.answering_started_at)}</span>
@@ -1687,69 +1919,120 @@
 
               {#if admin && !overlay}
                 <div class="q-actions" style="display: flex; align-items: center; gap: 6px;">
-                  {#if item.is_deleted === 1}
-                    <button
-                      type="button"
-                      class="btn btn-secondary btn-sm"
-                      on:click={() => moderateQuestion(item.id, 'restore')}
-                      disabled={moderateBusy.has(item.id)}
-                    >Restore</button>
-                    <div style="margin-left: auto; display: flex; gap: 6px;">
-                      <ConfirmButton
-                        class="btn btn-danger btn-sm"
-                        label={item.author_is_banned === 1 ? 'Banned' : 'Ban'}
-                        confirmLabel="Confirm ban"
-                        disabled={moderateBusy.has(item.id) || item.author_is_banned === 1}
-                        on:confirm={() => moderateQuestion(item.id, 'ban')}
-                      />
-                    </div>
-                  {:else}
-                    {#if sessionData?.is_active === 1}
-                      {#if item.is_answered === 0}
-                        <button
-                          type="button"
-                          class="btn btn-secondary btn-sm"
-                          on:click={() => moderateQuestion(item.id, item.is_answering === 1 ? 'finish_answering' : 'answer')}
-                          disabled={moderateBusy.has(item.id) || (item.is_answering === 0 && activeAnsweringQuestionId !== null)}
-                          title={item.is_answering === 0 && activeAnsweringQuestionId !== null ? 'Finish current in-progress question first' : undefined}
-                        >{item.is_answering === 1 ? 'Done' : 'Answer'}</button>
+                  {#if item.kind === 'donation'}
+                    {#if item.is_deleted === 1}
+                      <button
+                        type="button"
+                        class="btn btn-secondary btn-sm"
+                        on:click={() => moderateDonation(item.donation_id, 'restore')}
+                        disabled={moderateDonationBusy.has(item.donation_id)}
+                      >Restore</button>
+                    {:else}
+                      {#if sessionData?.is_active === 1}
+                        {#if item.is_answered === 0}
+                          <button
+                            type="button"
+                            class="btn btn-secondary btn-sm"
+                            on:click={() => moderateDonation(item.donation_id, item.is_answering === 1 ? 'finish_answering' : 'answer')}
+                            disabled={moderateDonationBusy.has(item.donation_id) || (item.is_answering === 0 && hasOtherActiveAnsweringItem('donation', item.donation_id))}
+                            title={item.is_answering === 0 && hasOtherActiveAnsweringItem('donation', item.donation_id) ? currentAnsweringConflictMessage() : undefined}
+                          >{item.is_answering === 1 ? 'Done' : 'Answer'}</button>
+                        {/if}
+
+                        {#if item.is_answering === 1 || item.is_answered === 1}
+                          <button
+                            type="button"
+                            class="btn btn-secondary btn-sm"
+                            on:click={() => moderateDonation(item.donation_id, 'reopen')}
+                            disabled={moderateDonationBusy.has(item.donation_id)}
+                          >Undo</button>
+                        {/if}
+
+                        {#if item.is_answered === 0 && item.is_rejected === 0}
+                          <button
+                            type="button"
+                            class="btn btn-secondary btn-sm"
+                            on:click={() => moderateDonation(item.donation_id, 'reject')}
+                            disabled={moderateDonationBusy.has(item.donation_id)}
+                          >Reject</button>
+                        {/if}
                       {/if}
 
-                      {#if item.is_answering === 1 || item.is_answered === 1}
-                        <button
-                          type="button"
-                          class="btn btn-secondary btn-sm"
-                          on:click={() => moderateQuestion(item.id, 'reopen')}
-                          disabled={moderateBusy.has(item.id)}
-                        >Undo</button>
-                      {/if}
-
-                      {#if item.is_answered === 0 && item.is_rejected === 0}
-                        <button
-                          type="button"
-                          class="btn btn-secondary btn-sm"
-                          on:click={() => moderateQuestion(item.id, 'reject')}
-                          disabled={moderateBusy.has(item.id)}
-                        >Reject</button>
-                      {/if}
+                      <div style="margin-left: auto; display: flex; gap: 6px;">
+                        <ConfirmButton
+                          class="btn btn-danger btn-sm"
+                          label="Delete"
+                          confirmLabel="Confirm delete"
+                          disabled={moderateDonationBusy.has(item.donation_id)}
+                          on:confirm={() => moderateDonation(item.donation_id, 'delete')}
+                        />
+                      </div>
                     {/if}
-
-                    <div style="margin-left: auto; display: flex; gap: 6px;">
-                      <ConfirmButton
-                        class="btn btn-danger btn-sm"
-                        label="Delete"
-                        confirmLabel="Confirm delete"
+                  {:else}
+                    {#if item.is_deleted === 1}
+                      <button
+                        type="button"
+                        class="btn btn-secondary btn-sm"
+                        on:click={() => moderateQuestion(item.id, 'restore')}
                         disabled={moderateBusy.has(item.id)}
-                        on:confirm={() => moderateQuestion(item.id, 'delete')}
-                      />
-                      <ConfirmButton
-                        class="btn btn-danger btn-sm"
-                        label={item.author_is_banned === 1 ? 'Banned' : 'Ban'}
-                        confirmLabel="Confirm ban"
-                        disabled={moderateBusy.has(item.id) || item.author_is_banned === 1}
-                        on:confirm={() => moderateQuestion(item.id, 'ban')}
-                      />
-                    </div>
+                      >Restore</button>
+                      <div style="margin-left: auto; display: flex; gap: 6px;">
+                        <ConfirmButton
+                          class="btn btn-danger btn-sm"
+                          label={item.author_is_banned === 1 ? 'Banned' : 'Ban'}
+                          confirmLabel="Confirm ban"
+                          disabled={moderateBusy.has(item.id) || item.author_is_banned === 1}
+                          on:confirm={() => moderateQuestion(item.id, 'ban')}
+                        />
+                      </div>
+                    {:else}
+                      {#if sessionData?.is_active === 1}
+                        {#if item.is_answered === 0}
+                          <button
+                            type="button"
+                            class="btn btn-secondary btn-sm"
+                            on:click={() => moderateQuestion(item.id, item.is_answering === 1 ? 'finish_answering' : 'answer')}
+                            disabled={moderateBusy.has(item.id) || (item.is_answering === 0 && hasOtherActiveAnsweringItem('question', item.id))}
+                            title={item.is_answering === 0 && hasOtherActiveAnsweringItem('question', item.id) ? currentAnsweringConflictMessage() : undefined}
+                          >{item.is_answering === 1 ? 'Done' : 'Answer'}</button>
+                        {/if}
+
+                        {#if item.is_answering === 1 || item.is_answered === 1}
+                          <button
+                            type="button"
+                            class="btn btn-secondary btn-sm"
+                            on:click={() => moderateQuestion(item.id, 'reopen')}
+                            disabled={moderateBusy.has(item.id)}
+                          >Undo</button>
+                        {/if}
+
+                        {#if item.is_answered === 0 && item.is_rejected === 0}
+                          <button
+                            type="button"
+                            class="btn btn-secondary btn-sm"
+                            on:click={() => moderateQuestion(item.id, 'reject')}
+                            disabled={moderateBusy.has(item.id)}
+                          >Reject</button>
+                        {/if}
+                      {/if}
+
+                      <div style="margin-left: auto; display: flex; gap: 6px;">
+                        <ConfirmButton
+                          class="btn btn-danger btn-sm"
+                          label="Delete"
+                          confirmLabel="Confirm delete"
+                          disabled={moderateBusy.has(item.id)}
+                          on:confirm={() => moderateQuestion(item.id, 'delete')}
+                        />
+                        <ConfirmButton
+                          class="btn btn-danger btn-sm"
+                          label={item.author_is_banned === 1 ? 'Banned' : 'Ban'}
+                          confirmLabel="Confirm ban"
+                          disabled={moderateBusy.has(item.id) || item.author_is_banned === 1}
+                          on:confirm={() => moderateQuestion(item.id, 'ban')}
+                        />
+                      </div>
+                    {/if}
                   {/if}
                 </div>
               {/if}
@@ -1871,5 +2154,40 @@
     letter-spacing: 0.06em;
     color: var(--ink-secondary);
     text-align: center;
+  }
+
+  :global(.q-card.donation) {
+    border-color: #fed7aa;
+    background: #fff7ed;
+  }
+
+  :global(.q-card.donation:hover) {
+    border-color: #fdba74;
+  }
+
+  :global(.q-card.donation.answering) {
+    border-color: var(--blue-border);
+    background: var(--blue-soft);
+  }
+
+  .q-donation-amount {
+    color: var(--orange);
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-align: center;
+    min-width: 0;
+    max-width: 56px;
+    word-break: break-word;
+    white-space: normal;
+    line-height: 1.3;
+  }
+
+  .q-donation-value,
+  .q-donation-currency {
+    display: block;
+  }
+
+  .q-donation-currency {
+    font-size: 0.72em;
   }
 </style>

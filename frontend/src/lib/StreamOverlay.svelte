@@ -52,6 +52,16 @@
     if (score === 0) return '#94a3b8'
     return '#f87171'
   }
+
+  function formatDonationMajor(amountMinor) {
+    const normalizedAmountMinor = typeof amountMinor === 'number' ? amountMinor : 0
+    const major = normalizedAmountMinor / 100
+    return major % 1 === 0 ? `${Math.round(major)}` : major.toFixed(2)
+  }
+
+  function formatDonationCurrency(currency) {
+    return currency ?? ''
+  }
 </script>
 
 <div class="overlay-root">
@@ -67,10 +77,17 @@
       <p class="empty-msg">No questions yet.</p>
     {:else}
       {#each questions as q}
-        <div class="q-row" class:answering={q.is_answering === 1} class:answered={q.is_answered === 1}>
-          <span class="q-score" style="color: {scoreColor(q.score)}">
-            {q.score > 0 ? '+' : ''}{q.score}
-          </span>
+        <div class="q-row" class:answering={q.is_answering === 1} class:answered={q.is_answered === 1} class:donation={q.kind === 'donation'}>
+          {#if q.kind === 'donation'}
+            <span class="q-score q-donation-score" style="color: #ea580c;">
+              <span class="q-donation-value">{formatDonationMajor(q.donation_amount_minor)}</span>
+              <span class="q-donation-currency">{formatDonationCurrency(q.donation_currency)}</span>
+            </span>
+          {:else}
+            <span class="q-score" style="color: {scoreColor(q.score)}">
+              {q.score > 0 ? '+' : ''}{q.score}
+            </span>
+          {/if}
           <span class="q-text">
             {#if q.is_answering === 1}
               <span class="q-badge answering-badge">Answering</span>
@@ -145,6 +162,24 @@
 
   .q-row.answered {
     opacity: 0.45;
+  }
+
+  .q-row.donation {
+    border-left-color: #ea580c;
+    background: rgba(234, 88, 12, 0.06);
+  }
+
+  .q-donation-score {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    line-height: 1.2;
+    text-align: center;
+  }
+
+  .q-donation-currency {
+    font-size: 0.6em;
   }
 
   .q-score {

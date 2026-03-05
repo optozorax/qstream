@@ -44,6 +44,7 @@ Environment variables:
   REMOTE_BACKEND_INTERNAL_PORT=43000
   REMOTE_TUNNEL_BIND_ADDRESS=127.0.0.1
   INSTALL_FRONTEND_DEPS=1
+  BACKEND_START_TIMEOUT_SECONDS=60
 
 Optional local env file:
   .env.tunnel (fallback: .env.tunnel.local, .env.local, or LOCAL_ENV_FILE=<path>)
@@ -68,6 +69,7 @@ REMOTE_BACKEND_INTERNAL_PORT="${REMOTE_BACKEND_INTERNAL_PORT:-43000}"
 REMOTE_TUNNEL_BIND_ADDRESS="${REMOTE_TUNNEL_BIND_ADDRESS:-127.0.0.1}"
 
 INSTALL_FRONTEND_DEPS="${INSTALL_FRONTEND_DEPS:-1}"
+BACKEND_START_TIMEOUT_SECONDS="${BACKEND_START_TIMEOUT_SECONDS:-60}"
 
 BACKEND_PID=""
 FRONTEND_PID=""
@@ -119,6 +121,55 @@ validate_port() {
   if ((value < 1 || value > 65535)); then
     die "${name} must be between 1 and 65535, got: ${value}"
   fi
+}
+
+validate_positive_integer() {
+  local value="$1"
+  local name="$2"
+  if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+    die "${name} must be a positive integer, got: ${value}"
+  fi
+  if ((value < 1)); then
+    die "${name} must be greater than zero, got: ${value}"
+  fi
+}
+
+resolve_backend_bin() {
+  local candidates=()
+  local candidate
+
+  if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+    if [[ "${CARGO_TARGET_DIR}" = /* ]]; then
+      candidates+=("${CARGO_TARGET_DIR}/debug/qstream-backend")
+    else
+      candidates+=("${ROOT_DIR}/backend/${CARGO_TARGET_DIR}/debug/qstream-backend")
+    fi
+  fi
+
+  candidates+=(
+    "${ROOT_DIR}/backend/target/debug/qstream-backend"
+    "${ROOT_DIR}/backend/target-wsl/debug/qstream-backend"
+  )
+
+  for candidate in "${candidates[@]}"; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  candidate="$(
+    find "${ROOT_DIR}/backend" -maxdepth 5 -type f -name qstream-backend -path '*/debug/*' -printf '%T@ %p\n' 2>/dev/null \
+      | sort -nr \
+      | head -n 1 \
+      | cut -d' ' -f2-
+  )"
+  if [[ -n "${candidate}" && -x "${candidate}" ]]; then
+    printf '%s\n' "${candidate}"
+    return 0
+  fi
+
+  return 1
 }
 
 pids_listening_on_port() {
@@ -199,7 +250,8 @@ wait_for_local_port() {
   local port="$1"
   local name="$2"
   local pid="$3"
-  local max_checks=120
+  local timeout_seconds="${4:-60}"
+  local max_checks=$((timeout_seconds * 2))
 
   for ((i=0; i<max_checks; i++)); do
     if (echo >"/dev/tcp/127.0.0.1/${port}") >/dev/null 2>&1; then
@@ -211,7 +263,7 @@ wait_for_local_port() {
     sleep 0.5
   done
 
-  die "Timed out waiting for ${name} on 127.0.0.1:${port}"
+  die "Timed out waiting ${timeout_seconds}s for ${name} on 127.0.0.1:${port}"
 }
 
 verify_remote_bind_address() {
@@ -259,6 +311,8 @@ verify_remote_bind_address() {
 require_cmd ssh
 require_cmd cargo
 require_cmd npm
+require_cmd perl
+require_cmd make
 
 require_non_empty "${SSH_TARGET}" "SSH_TARGET"
 require_non_empty "${SSH_KEY_PATH}" "SSH_KEY_PATH"
@@ -272,6 +326,7 @@ validate_port "${LOCAL_FRONTEND_PORT}" "LOCAL_FRONTEND_PORT"
 validate_port "${LOCAL_BACKEND_PORT}" "LOCAL_BACKEND_PORT"
 validate_port "${REMOTE_FRONTEND_INTERNAL_PORT}" "REMOTE_FRONTEND_INTERNAL_PORT"
 validate_port "${REMOTE_BACKEND_INTERNAL_PORT}" "REMOTE_BACKEND_INTERNAL_PORT"
+validate_positive_integer "${BACKEND_START_TIMEOUT_SECONDS}" "BACKEND_START_TIMEOUT_SECONDS"
 
 SSH_TARGET_HOST="$(extract_ssh_host "${SSH_TARGET}")"
 if [[ "${REMOTE_TUNNEL_BIND_ADDRESS}" =~ ^(127\.0\.0\.1|localhost|::1)$ ]] && [[ "${SSH_TARGET_HOST}" != "${PUBLIC_HOST}" ]]; then
@@ -289,6 +344,15 @@ if [[ "${INSTALL_FRONTEND_DEPS}" == "1" && ! -d frontend/node_modules ]]; then
   (cd frontend && npm ci)
 fi
 
+log "Compiling backend (no timeout)..."
+(
+  cd backend
+  OPENSSL_STATIC=1 cargo build
+)
+
+BACKEND_BIN="$(resolve_backend_bin || true)"
+[[ -n "${BACKEND_BIN}" ]] || die "Backend binary not found. Expected debug binary under backend/target*/debug."
+
 log "Starting backend on 127.0.0.1:${LOCAL_BACKEND_PORT}..."
 (
   cd backend
@@ -302,11 +366,11 @@ log "Starting backend on 127.0.0.1:${LOCAL_BACKEND_PORT}..."
   APP_ADDR="127.0.0.1:${LOCAL_BACKEND_PORT}" \
   FRONTEND_ORIGIN="https://${PUBLIC_HOST}" \
   PUBLIC_BASE_URL="https://${PUBLIC_HOST}" \
-  cargo run
+  exec "${BACKEND_BIN}"
 ) &
 BACKEND_PID="$!"
 
-wait_for_local_port "${LOCAL_BACKEND_PORT}" "backend" "${BACKEND_PID}"
+wait_for_local_port "${LOCAL_BACKEND_PORT}" "backend" "${BACKEND_PID}" "${BACKEND_START_TIMEOUT_SECONDS}"
 
 log "Starting frontend on 127.0.0.1:${LOCAL_FRONTEND_PORT}..."
 (

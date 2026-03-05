@@ -762,6 +762,10 @@
       addNotification('Question max length is 300 characters.', 'error')
       return
     }
+    if (countLineBreaks(text) > 5) {
+      addNotification('Question can contain at most 5 line breaks.', 'error')
+      return
+    }
 
     questionBusy = true
 
@@ -1018,6 +1022,10 @@
 
   function nowUnix() {
     return Math.floor(Date.now() / 1000)
+  }
+
+  function countLineBreaks(text) {
+    return (text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').match(/\n/g) || []).length
   }
 
   function formatDuration(seconds) {

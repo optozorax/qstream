@@ -1141,6 +1141,11 @@ async fn create_question(
             "question text must contain 1..300 characters",
         ));
     }
+    if count_line_breaks(text) > 5 {
+        return Err(AppError::bad_request(
+            "question can contain at most 5 line breaks",
+        ));
+    }
 
     let insert = sqlx::query(
         r#"
@@ -2184,6 +2189,26 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn count_line_breaks(text: &str) -> usize {
+    let mut count = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\n' => {
+                count += 1;
+            }
+            '\r' => {
+                count += 1;
+                if matches!(chars.peek(), Some('\n')) {
+                    let _ = chars.next();
+                }
+            }
+            _ => {}
+        }
+    }
+    count
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {

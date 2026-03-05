@@ -73,6 +73,7 @@ Use returned token in header (`auth_token` from URL fragment after OAuth callbac
   - auth required
   - only session owner can call it
   - body: `{ "action": "answer" | "finish_answering" | "reopen" | "reject" | "delete" | "ban" }`
+  - only one question per session can be in `answering` state at a time
   - `answer` sets `is_answering=1`, records `answering_started_at`
   - `finish_answering` sets `is_answered=1`, records `answered_at`
   - `reopen` clears `is_answering` and `is_answered` (moves back to active queue)

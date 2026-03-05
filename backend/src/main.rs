@@ -1469,13 +1469,22 @@ async fn moderate_question(
                 SET status = ?2,
                     answering_started_at = unixepoch(),
                     answered_at = NULL
-                WHERE id = ?1 AND status IN (?3, ?4);
+                WHERE id = ?1
+                  AND status IN (?3, ?4)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM questions other
+                      WHERE other.session_id = ?5
+                        AND other.status = ?2
+                        AND other.id != ?1
+                  );
                 "#,
             )
             .bind(question_id)
             .bind(QuestionStatus::Answering.as_str())
             .bind(QuestionStatus::New.as_str())
             .bind(QuestionStatus::Rejected.as_str())
+            .bind(meta.session_id)
             .execute(&state.db)
             .await
             .map_err(|err| {
@@ -1483,6 +1492,33 @@ async fn moderate_question(
             })?;
 
             if update.rows_affected() == 0 {
+                let another_answering_exists = sqlx::query_scalar::<_, i64>(
+                    r#"
+                    SELECT 1
+                    FROM questions
+                    WHERE session_id = ?1
+                      AND status = ?2
+                      AND id != ?3
+                    LIMIT 1;
+                    "#,
+                )
+                .bind(meta.session_id)
+                .bind(QuestionStatus::Answering.as_str())
+                .bind(question_id)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|err| {
+                    AppError::internal(format!(
+                        "failed to verify in-progress question uniqueness: {err}"
+                    ))
+                })?;
+
+                if another_answering_exists.is_some() {
+                    return Err(AppError::bad_request(
+                        "another question is already being answered in this session",
+                    ));
+                }
+
                 return Err(AppError::bad_request(
                     "cannot mark this question as in-progress",
                 ));

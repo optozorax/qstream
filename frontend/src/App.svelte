@@ -843,6 +843,8 @@
     sessionData.is_active === 1 &&
     currentUser.id !== sessionData.owner_user_id &&
     !viewerIsBanned
+  $: activeAnsweringQuestionId =
+    questions.find((question) => question.is_answering === 1)?.id ?? null
 
   async function moderateQuestion(questionId, action) {
     if (!authToken) {
@@ -852,6 +854,11 @@
 
     if (!admin) {
       addNotification('Only session owner can moderate questions.', 'error')
+      return
+    }
+
+    if (action === 'answer' && activeAnsweringQuestionId !== null && activeAnsweringQuestionId !== questionId) {
+      addNotification('Finish the current in-progress question first.', 'error')
       return
     }
 
@@ -1655,7 +1662,8 @@
                           type="button"
                           class="btn btn-secondary btn-sm"
                           on:click={() => moderateQuestion(item.id, item.is_answering === 1 ? 'finish_answering' : 'answer')}
-                          disabled={moderateBusy.has(item.id)}
+                          disabled={moderateBusy.has(item.id) || (item.is_answering === 0 && activeAnsweringQuestionId !== null)}
+                          title={item.is_answering === 0 && activeAnsweringQuestionId !== null ? 'Finish current in-progress question first' : undefined}
                         >{item.is_answering === 1 ? 'Done' : 'Answer'}</button>
                       {/if}
 

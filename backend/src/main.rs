@@ -899,7 +899,7 @@ async fn create_session(
                 inserted_id = Some(result.last_insert_rowid());
                 break;
             }
-            Err(err) if err.to_string().contains("stream_sessions.public_code") => continue,
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => continue,
             Err(err) => {
                 return Err(AppError::internal(format!(
                     "failed to create stream session: {err}"

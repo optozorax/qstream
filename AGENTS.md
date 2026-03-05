@@ -119,3 +119,11 @@ Templates:
 
 Ops/debug guide:
 - `docs/remote-server-operations.md`
+
+## Frontend/Backend Invariants
+
+All business rules must be enforced in the backend API and mirrored in the frontend UI.
+
+- Backend is the source of truth for permissions, state transitions, and validation.
+- Frontend checks (disabled buttons, hidden tabs, guard messages) are UX hints only and must never be the only enforcement layer.
+- When introducing or changing a rule, update both layers in the same change so predicates stay equivalent (for example owner-only actions, deleted-question restoration, and ban-state checks).

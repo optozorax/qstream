@@ -559,7 +559,7 @@
     updateMode = 'manual'
     updateModeTouched = false
     pendingNewQuestions = 0
-    if (!['top', 'new', 'answered', 'downvoted'].includes(sessionSort)) {
+    if (!['top', 'new', 'answered', 'downvoted', 'deleted'].includes(sessionSort)) {
       sessionSort = 'top'
     }
     localVotes = {}
@@ -823,6 +823,13 @@
 
   $: admin = !!currentUser && !!sessionData && currentUser.id === sessionData.owner_user_id
 
+  $: if (sessionSort === 'deleted' && !admin) {
+    sessionSort = 'top'
+    if (route.name === 'session' && activeSessionCode) {
+      void refreshQuestions(activeSessionCode)
+    }
+  }
+
   $: viewerCanInteract =
     !!currentUser &&
     !!sessionData &&
@@ -864,6 +871,8 @@
           addNotification('Question moved to answered.')
         } else if (action === 'reject') {
           addNotification('Question rejected.')
+        } else if (action === 'restore') {
+          addNotification('Question restored.')
         } else if (action === 'reopen') {
           addNotification('Question reopened.')
         } else {
@@ -1480,6 +1489,14 @@
             class:active={sessionSort === 'downvoted'}
             on:click={() => changeSort('downvoted')}
           >Bad</button>
+          {#if admin}
+            <button
+              type="button"
+              class="tab"
+              class:active={sessionSort === 'deleted'}
+              on:click={() => changeSort('deleted')}
+            >Deleted</button>
+          {/if}
         </div>
 
         <div class="toolbar-spacer"></div>
@@ -1529,11 +1546,24 @@
           Questions with a score of −{sessionData.downvote_threshold ?? 5} or lower are hidden from other tabs.
         </div>
       {/if}
+      {#if sessionSort === 'deleted' && sessionData && !loadingQuestions}
+        <div class="msg msg-info" style="margin-bottom: 12px; text-align: center;">
+          Only the session owner can see deleted questions.
+        </div>
+      {/if}
       <div class="q-list">
         {#if visibleQuestions.length === 0 && !loadingQuestions}
           <div class="empty-state">
             <div class="empty-state-icon">?</div>
-            <p>{hideInteracted && currentUser ? 'All questions filtered.' : 'No questions yet.'}</p>
+            <p>
+              {#if hideInteracted && currentUser}
+                All questions filtered.
+              {:else if sessionSort === 'deleted'}
+                No deleted questions.
+              {:else}
+                No questions yet.
+              {/if}
+            </p>
           </div>
         {/if}
 
@@ -1545,7 +1575,7 @@
                 class="q-vote-btn"
                 class:upvoted={localVotes[item.id] === 1}
                 on:click={() => vote(item.id, localVotes[item.id] === 1 ? 0 : 1)}
-                disabled={!viewerCanInteract || voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1 || item.is_rejected === 1}
+                disabled={!viewerCanInteract || voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1 || item.is_rejected === 1 || item.is_deleted === 1}
                 title="Upvote"
               >&#9650;</button>
 
@@ -1556,7 +1586,7 @@
                 class="q-vote-btn"
                 class:downvoted={localVotes[item.id] === -1}
                 on:click={() => vote(item.id, localVotes[item.id] === -1 ? 0 : -1)}
-                disabled={!viewerCanInteract || voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1 || item.is_rejected === 1}
+                disabled={!viewerCanInteract || voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1 || item.is_rejected === 1 || item.is_deleted === 1}
                 title="Downvote"
               >&#9660;</button>
             </div>
@@ -1568,6 +1598,8 @@
                 <span class="badge badge-answered">Answered</span>
               {:else if item.is_rejected === 1}
                 <span class="badge badge-rejected">Rejected</span>
+              {:else if item.is_deleted === 1}
+                <span class="badge badge-rejected">Deleted</span>
               {/if}
 
               <p class="q-text">{item.body}</p>
@@ -1589,51 +1621,69 @@
 
               {#if admin}
                 <div class="q-actions" style="display: flex; align-items: center; gap: 6px;">
-                  {#if sessionData?.is_active === 1}
-                    {#if item.is_answered === 0}
-                      <button
-                        type="button"
-                        class="btn btn-secondary btn-sm"
-                        on:click={() => moderateQuestion(item.id, item.is_answering === 1 ? 'finish_answering' : 'answer')}
-                        disabled={moderateBusy.has(item.id)}
-                      >{item.is_answering === 1 ? 'Done' : 'Answer'}</button>
+                  {#if item.is_deleted === 1}
+                    <button
+                      type="button"
+                      class="btn btn-secondary btn-sm"
+                      on:click={() => moderateQuestion(item.id, 'restore')}
+                      disabled={moderateBusy.has(item.id)}
+                    >Restore</button>
+                    <div style="margin-left: auto; display: flex; gap: 6px;">
+                      <ConfirmButton
+                        class="btn btn-danger btn-sm"
+                        label={item.author_is_banned === 1 ? 'Banned' : 'Ban'}
+                        confirmLabel="Confirm ban"
+                        disabled={moderateBusy.has(item.id) || item.author_is_banned === 1}
+                        on:confirm={() => moderateQuestion(item.id, 'ban')}
+                      />
+                    </div>
+                  {:else}
+                    {#if sessionData?.is_active === 1}
+                      {#if item.is_answered === 0}
+                        <button
+                          type="button"
+                          class="btn btn-secondary btn-sm"
+                          on:click={() => moderateQuestion(item.id, item.is_answering === 1 ? 'finish_answering' : 'answer')}
+                          disabled={moderateBusy.has(item.id)}
+                        >{item.is_answering === 1 ? 'Done' : 'Answer'}</button>
+                      {/if}
+
+                      {#if item.is_answering === 1 || item.is_answered === 1}
+                        <button
+                          type="button"
+                          class="btn btn-secondary btn-sm"
+                          on:click={() => moderateQuestion(item.id, 'reopen')}
+                          disabled={moderateBusy.has(item.id)}
+                        >Undo</button>
+                      {/if}
+
+                      {#if item.is_answered === 0 && item.is_rejected === 0}
+                        <button
+                          type="button"
+                          class="btn btn-secondary btn-sm"
+                          on:click={() => moderateQuestion(item.id, 'reject')}
+                          disabled={moderateBusy.has(item.id)}
+                        >Reject</button>
+                      {/if}
                     {/if}
 
-                    {#if item.is_answering === 1 || item.is_answered === 1}
-                      <button
-                        type="button"
-                        class="btn btn-secondary btn-sm"
-                        on:click={() => moderateQuestion(item.id, 'reopen')}
+                    <div style="margin-left: auto; display: flex; gap: 6px;">
+                      <ConfirmButton
+                        class="btn btn-danger btn-sm"
+                        label="Delete"
+                        confirmLabel="Confirm delete"
                         disabled={moderateBusy.has(item.id)}
-                      >Undo</button>
-                    {/if}
-
-                    {#if item.is_answered === 0 && item.is_rejected === 0}
-                      <button
-                        type="button"
-                        class="btn btn-secondary btn-sm"
-                        on:click={() => moderateQuestion(item.id, 'reject')}
-                        disabled={moderateBusy.has(item.id)}
-                      >Reject</button>
-                    {/if}
+                        on:confirm={() => moderateQuestion(item.id, 'delete')}
+                      />
+                      <ConfirmButton
+                        class="btn btn-danger btn-sm"
+                        label={item.author_is_banned === 1 ? 'Banned' : 'Ban'}
+                        confirmLabel="Confirm ban"
+                        disabled={moderateBusy.has(item.id) || item.author_is_banned === 1}
+                        on:confirm={() => moderateQuestion(item.id, 'ban')}
+                      />
+                    </div>
                   {/if}
-
-                  <div style="margin-left: auto; display: flex; gap: 6px;">
-                    <ConfirmButton
-                      class="btn btn-danger btn-sm"
-                      label="Delete"
-                      confirmLabel="Confirm delete"
-                      disabled={moderateBusy.has(item.id)}
-                      on:confirm={() => moderateQuestion(item.id, 'delete')}
-                    />
-                    <ConfirmButton
-                      class="btn btn-danger btn-sm"
-                      label="Ban"
-                      confirmLabel="Confirm ban"
-                      disabled={moderateBusy.has(item.id)}
-                      on:confirm={() => moderateQuestion(item.id, 'ban')}
-                    />
-                  </div>
                 </div>
               {/if}
             </div>

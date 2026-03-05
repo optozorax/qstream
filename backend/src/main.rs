@@ -220,6 +220,7 @@ enum ModerateAction {
     FinishAnswering,
     Reject,
     Reopen,
+    Restore,
     Delete,
     Ban,
 }
@@ -260,6 +261,7 @@ struct QuestionView {
     session_id: i64,
     author_user_id: i64,
     author_nickname: String,
+    author_is_banned: i64,
     body: String,
     is_answering: i64,
     is_answered: i64,
@@ -403,6 +405,7 @@ enum QuestionSort {
     New,
     Answered,
     Downvoted,
+    Deleted,
 }
 
 #[tokio::main]
@@ -933,6 +936,12 @@ async fn list_questions(
     let viewer_user_id = optional_auth_user_id(&state, &headers).await;
 
     let sort = query.sort.unwrap_or(QuestionSort::Top);
+    let viewer_is_owner = viewer_user_id == Some(session.owner_user_id);
+    if sort == QuestionSort::Deleted && !viewer_is_owner {
+        return Err(AppError::forbidden(
+            "only session owner can view deleted questions",
+        ));
+    }
 
     let questions = list_questions_for_session(
         &state.db,
@@ -1599,6 +1608,9 @@ async fn moderate_question(
             if meta.author_user_id == auth.user_id {
                 return Err(AppError::bad_request("cannot ban yourself"));
             }
+            if is_user_banned(&state.db, meta.owner_user_id, meta.author_user_id).await? {
+                return Err(AppError::bad_request("user is already banned"));
+            }
 
             sqlx::query(
                 r#"
@@ -1650,6 +1662,41 @@ async fn moderate_question(
                 deleted: false,
                 banned: true,
                 question: None,
+            }))
+        }
+        ModerateAction::Restore => {
+            let update = sqlx::query(
+                r#"
+                UPDATE questions
+                SET status = ?2,
+                    answering_started_at = NULL,
+                    answered_at = NULL
+                WHERE id = ?1 AND status = ?3;
+                "#,
+            )
+            .bind(question_id)
+            .bind(QuestionStatus::New.as_str())
+            .bind(QuestionStatus::Deleted.as_str())
+            .execute(&state.db)
+            .await
+            .map_err(|err| AppError::internal(format!("failed to restore question: {err}")))?;
+
+            if update.rows_affected() == 0 {
+                return Err(AppError::bad_request("question is not deleted"));
+            }
+
+            let question = fetch_question_by_id(&state.db, question_id).await?;
+            tracing::info!(question_id, user_id = auth.user_id, "question restored");
+            state
+                .session_events
+                .publish(meta.session_id, SessionEvent::question_changed(question_id))
+                .await;
+
+            Ok(Json(ModerateQuestionResponse {
+                question_id,
+                deleted: false,
+                banned: false,
+                question: Some(question),
             }))
         }
         ModerateAction::Reopen => {
@@ -2011,6 +2058,10 @@ async fn list_questions_for_session(
             ),
             "ORDER BY q.score ASC, q.created_at DESC".to_string(),
         ),
+        QuestionSort::Deleted => (
+            format!("WHERE q.session_id = ?1 AND q.status = '{status_deleted}'"),
+            "ORDER BY q.created_at DESC".to_string(),
+        ),
     };
 
     let sql = format!(
@@ -2020,6 +2071,12 @@ async fn list_questions_for_session(
             q.session_id,
             q.author_user_id,
             u.nickname AS author_nickname,
+            EXISTS(
+                SELECT 1
+                FROM bans b
+                WHERE b.owner_user_id = s.owner_user_id
+                  AND b.user_id = q.author_user_id
+            ) AS author_is_banned,
             q.body,
             (q.status = '{status_answering}') AS is_answering,
             (q.status = '{status_answered}') AS is_answered,
@@ -2032,6 +2089,7 @@ async fn list_questions_for_session(
             q.answering_started_at,
             q.answered_at
         FROM questions q
+        JOIN stream_sessions s ON s.id = q.session_id
         JOIN users u ON u.id = q.author_user_id
         LEFT JOIN votes uv ON uv.question_id = q.id AND uv.user_id = ?2
         {filter}
@@ -2066,6 +2124,12 @@ async fn fetch_question_by_id(db: &SqlitePool, question_id: i64) -> Result<Quest
             q.session_id,
             q.author_user_id,
             u.nickname AS author_nickname,
+            EXISTS(
+                SELECT 1
+                FROM bans b
+                WHERE b.owner_user_id = s.owner_user_id
+                  AND b.user_id = q.author_user_id
+            ) AS author_is_banned,
             q.body,
             (q.status = '{status_answering}') AS is_answering,
             (q.status = '{status_answered}') AS is_answered,
@@ -2078,6 +2142,7 @@ async fn fetch_question_by_id(db: &SqlitePool, question_id: i64) -> Result<Quest
             q.answering_started_at,
             q.answered_at
         FROM questions q
+        JOIN stream_sessions s ON s.id = q.session_id
         JOIN users u ON u.id = q.author_user_id
         WHERE q.id = ?1
         LIMIT 1;

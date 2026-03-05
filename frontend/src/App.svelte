@@ -1301,6 +1301,9 @@
         <p class="subtitle">
           Collect and rank audience questions in real time during your stream.
         </p>
+        <p class="text-sm text-secondary" style="margin: -8px 0 18px; text-align: center;">
+          <a href="https://github.com/optozorax/qstream" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </p>
 
         {#if currentUser}
           <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px;">
@@ -1446,6 +1449,13 @@
             <span class="status-dot" class:connected={sseConnected} class:disconnected={!sseConnected}></span>
             {sseConnected ? 'Live' : 'Reconnecting'}
           </span>
+
+          <a
+            href="https://github.com/optozorax/qstream"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="btn btn-ghost btn-sm"
+          >GitHub</a>
 
           <a
             href={`/s/${route.code}/overlay`}

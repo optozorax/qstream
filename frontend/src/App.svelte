@@ -1639,6 +1639,10 @@
                 <p class="text-sm text-secondary">Not connected. Connect to receive donations in real time.</p>
                 <button type="button" class="btn btn-secondary btn-sm" style="align-self: flex-start;" on:click={connectDonationAlerts}>Connect DonationAlerts</button>
               {/if}
+              <p class="text-sm text-secondary" style="margin: 0;">
+                DonationAlerts access can be disabled anytime in
+                <a href="https://www.donationalerts.com/dashboard/general-settings/apps" target="_blank" rel="noopener noreferrer">DonationAlerts app settings</a>.
+              </p>
             </div>
           </div>
         </div>
@@ -1703,7 +1707,11 @@
               submitLabel="Continue with Google"
               returnTo={`/s/${route.code}`}
             />
-            <p class="text-sm text-secondary" style="margin-top: 12px;">Google login only requests your name — not your email address.</p>
+            <p class="text-sm text-secondary" style="margin-top: 12px;">
+              Google login only requests your name — not your email address.
+              This app can be disabled anytime in
+              <a href="https://myaccount.google.com/connections" target="_blank" rel="noopener noreferrer">Google account connections</a>.
+            </p>
           </div>
         </div>
       {/if}

@@ -210,7 +210,18 @@ struct VoteRequest {
 
 #[derive(Deserialize)]
 struct ModerateQuestionRequest {
-    action: String,
+    action: ModerateAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ModerateAction {
+    Answer,
+    FinishAnswering,
+    Reject,
+    Reopen,
+    Delete,
+    Ban,
 }
 
 #[derive(Serialize, FromRow)]
@@ -272,6 +283,7 @@ struct QuestionAdminMeta {
     session_id: i64,
     owner_user_id: i64,
     author_user_id: i64,
+    session_is_active: i64,
     session_name: Option<String>,
     question_body: String,
 }
@@ -290,7 +302,7 @@ struct ListUserSessionsResponse {
 #[derive(Serialize)]
 struct ListQuestionsResponse {
     session: StreamSession,
-    sort: String,
+    sort: QuestionSort,
     questions: Vec<QuestionView>,
     question_cooldown_remaining: i64,
     viewer_is_banned: bool,
@@ -343,7 +355,7 @@ struct GoogleUserInfoResponse {
 
 #[derive(Deserialize, Default)]
 struct ListQuestionsQuery {
-    sort: Option<String>,
+    sort: Option<QuestionSort>,
 }
 
 #[derive(FromRow)]
@@ -351,10 +363,11 @@ struct QuestionVoteMetaRow {
     session_id: i64,
     owner_user_id: i64,
     session_is_active: i64,
-    status: String,
+    status: QuestionStatus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 enum QuestionStatus {
     New,
     Answering,
@@ -373,17 +386,6 @@ impl QuestionStatus {
             Self::Deleted => "deleted",
         }
     }
-
-    fn from_db(value: &str) -> Option<Self> {
-        match value {
-            "new" => Some(Self::New),
-            "answering" => Some(Self::Answering),
-            "answered" => Some(Self::Answered),
-            "rejected" => Some(Self::Rejected),
-            "deleted" => Some(Self::Deleted),
-            _ => None,
-        }
-    }
 }
 
 struct QuestionVoteMeta {
@@ -393,33 +395,14 @@ struct QuestionVoteMeta {
     status: QuestionStatus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum QuestionSort {
+    #[serde(alias = "popular")]
     Top,
     New,
     Answered,
     Downvoted,
-}
-
-impl QuestionSort {
-    fn parse(s: &str) -> Option<Self> {
-        match s {
-            "top" | "popular" => Some(Self::Top),
-            "new" => Some(Self::New),
-            "answered" => Some(Self::Answered),
-            "downvoted" => Some(Self::Downvoted),
-            _ => None,
-        }
-    }
-
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Top => "top",
-            Self::New => "new",
-            Self::Answered => "answered",
-            Self::Downvoted => "downvoted",
-        }
-    }
 }
 
 #[tokio::main]
@@ -949,10 +932,7 @@ async fn list_questions(
     let session = find_session_by_code(&state.db, &code).await?;
     let viewer_user_id = optional_auth_user_id(&state, &headers).await;
 
-    let raw_sort = query.sort.as_deref().unwrap_or("top");
-    let sort = QuestionSort::parse(raw_sort).ok_or_else(|| {
-        AppError::bad_request("sort must be 'top', 'new', 'answered', or 'downvoted'")
-    })?;
+    let sort = query.sort.unwrap_or(QuestionSort::Top);
 
     let questions = list_questions_for_session(
         &state.db,
@@ -988,7 +968,7 @@ async fn list_questions(
 
     Ok(Json(ListQuestionsResponse {
         session,
-        sort: sort.as_str().to_string(),
+        sort,
         questions,
         question_cooldown_remaining,
         viewer_is_banned,
@@ -1228,12 +1208,7 @@ async fn vote_question(
         session_id: question_meta_row.session_id,
         owner_user_id: question_meta_row.owner_user_id,
         session_is_active: question_meta_row.session_is_active,
-        status: QuestionStatus::from_db(&question_meta_row.status).ok_or_else(|| {
-            AppError::internal(format!(
-                "unknown question status: {}",
-                question_meta_row.status
-            ))
-        })?,
+        status: question_meta_row.status,
     };
 
     if question_meta.owner_user_id == auth.user_id {
@@ -1436,6 +1411,7 @@ async fn moderate_question(
         SELECT s.id AS session_id,
                s.owner_user_id,
                q.author_user_id,
+               s.is_active AS session_is_active,
                s.name AS session_name,
                q.body AS question_body
         FROM questions q
@@ -1456,8 +1432,23 @@ async fn moderate_question(
         ));
     }
 
-    match payload.action.as_str() {
-        "answer" => {
+    let action = payload.action;
+    if meta.session_is_active == 0
+        && matches!(
+            action,
+            ModerateAction::Answer
+                | ModerateAction::FinishAnswering
+                | ModerateAction::Reject
+                | ModerateAction::Reopen
+        )
+    {
+        return Err(AppError::forbidden(
+            "session is stopped: only delete and ban are allowed",
+        ));
+    }
+
+    match action {
+        ModerateAction::Answer => {
             let update = sqlx::query(
                 r#"
                 UPDATE questions
@@ -1501,7 +1492,7 @@ async fn moderate_question(
                 question: Some(question),
             }))
         }
-        "finish_answering" => {
+        ModerateAction::FinishAnswering => {
             let update = sqlx::query(
                 r#"
                 UPDATE questions
@@ -1539,7 +1530,7 @@ async fn moderate_question(
                 question: Some(question),
             }))
         }
-        "reject" => {
+        ModerateAction::Reject => {
             let update = sqlx::query(
                 r#"
                 UPDATE questions
@@ -1577,7 +1568,7 @@ async fn moderate_question(
                 question: Some(question),
             }))
         }
-        "delete" => {
+        ModerateAction::Delete => {
             // Soft-delete: mark question as deleted instead of removing from DB.
             sqlx::query(
                 r#"
@@ -1604,7 +1595,7 @@ async fn moderate_question(
                 question: None,
             }))
         }
-        "ban" => {
+        ModerateAction::Ban => {
             if meta.author_user_id == auth.user_id {
                 return Err(AppError::bad_request("cannot ban yourself"));
             }
@@ -1661,7 +1652,7 @@ async fn moderate_question(
                 question: None,
             }))
         }
-        "reopen" => {
+        ModerateAction::Reopen => {
             let update = sqlx::query(
                 r#"
                 UPDATE questions
@@ -1699,9 +1690,6 @@ async fn moderate_question(
                 question: Some(question),
             }))
         }
-        _ => Err(AppError::bad_request(
-            "action must be one of: answer, finish_answering, reject, reopen, delete, ban",
-        )),
     }
 }
 

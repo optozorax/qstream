@@ -230,6 +230,10 @@
   }
 
   function parseRoute(pathname) {
+    const overlayMatch = pathname.match(/^\/s\/([A-Za-z0-9_-]+)\/overlay$/)
+    if (overlayMatch) {
+      return { name: 'session', code: overlayMatch[1], overlay: true }
+    }
     const match = pathname.match(/^\/s\/([A-Za-z0-9_-]+)$/)
     if (match) {
       return { name: 'session', code: match[1] }
@@ -1106,6 +1110,28 @@
     setTimecodeStartFromUnix(sessionData.created_at)
     void loadTimecodeQuestions()
   }
+
+  $: overlay = !!route.overlay
+
+  let overlayQrSvg = ''
+  $: if (overlay && route.code) {
+    void generateOverlayQr(route.code)
+  }
+
+  async function generateOverlayQr(code) {
+    try {
+      const pageUrl = `${window.location.origin}/s/${code}`
+      const QRCode = (await import('qrcode')).default
+      overlayQrSvg = await QRCode.toString(pageUrl, {
+        type: 'svg',
+        margin: 1,
+        width: 140,
+        color: { dark: '#111827', light: '#ffffff' }
+      })
+    } catch {
+      // silently ignore
+    }
+  }
 </script>
 
 <svelte:head>
@@ -1254,6 +1280,7 @@
 
   {:else}
     <!-- SESSION PAGE -->
+    {#if !overlay}
     <header class="app-header">
       <div class="app-header-inner">
         <a class="app-logo" href="/" on:click|preventDefault={() => goto('/')}>
@@ -1265,6 +1292,20 @@
             <span class="status-dot" class:connected={sseConnected} class:disconnected={!sseConnected}></span>
             {sseConnected ? 'Live' : 'Reconnecting'}
           </span>
+
+          <a
+            href={`/s/${route.code}/overlay`}
+            target="_blank"
+            rel="noopener noreferrer"
+            class="btn btn-ghost btn-sm"
+            title="Stream view"
+            style="padding: 6px 8px;"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <rect x="2" y="3" width="20" height="14" rx="2" stroke="currentColor" stroke-width="2"/>
+              <path d="M8 21h8M12 17v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+          </a>
 
           {#if currentUser}
             <div class="user-pill">
@@ -1280,12 +1321,13 @@
         </div>
       </div>
     </header>
+    {/if}
 
     <div class="app-body">
       <div style="margin-bottom: 20px;">
         <div style="display: flex; align-items: center; justify-content: space-between;">
           <h1 style="margin: 0;">{sessionData?.name || 'Session'}</h1>
-          {#if admin}
+          {#if admin && !overlay}
             <button
               type="button"
               class="btn btn-secondary btn-sm"
@@ -1301,15 +1343,15 @@
             </button>
           {/if}
         </div>
-        {#if sessionData?.description}
+        {#if sessionData?.description && !overlay}
           <p class="text-sm text-secondary" style="margin-top: 4px;">{sessionData.description}</p>
         {/if}
-        {#if sessionData?.stream_link}
+        {#if sessionData?.stream_link && !overlay}
           <p class="text-sm" style="margin-top: 4px;">
             <a href={sessionData.stream_link} target="_blank" rel="noopener noreferrer">Watch stream</a>
           </p>
         {/if}
-        {#if sessionData}
+        {#if sessionData && !overlay}
           <p class="text-sm text-secondary" style="margin-top: 4px;">
             {#if sessionData.is_active === 1}
               Active for {formatDuration(nowUnix() - sessionData.created_at)}
@@ -1318,7 +1360,7 @@
             {/if}
           </p>
         {/if}
-        {#if !currentUser}
+        {#if !currentUser && !overlay}
           <p class="text-sm text-secondary" style="margin-top: 8px;">Log in to ask questions and vote.</p>
         {/if}
       </div>
@@ -1335,7 +1377,7 @@
         </div>
       {/if}
 
-      {#if admin && showSessionSettings}
+      {#if admin && showSessionSettings && !overlay}
         <div class="card section-gap" style="margin-bottom: 16px;">
           <h3 style="margin: 0 0 12px;">Session settings</h3>
           <form on:submit={updateSessionSettings}>
@@ -1389,7 +1431,7 @@
         </div>
       {/if}
 
-      {#if admin && sessionData && sessionData.is_active === 0}
+      {#if admin && sessionData && sessionData.is_active === 0 && !overlay}
         <div class="card section-gap" style="margin-bottom: 16px;">
           <h3 style="margin: 0 0 12px;">YouTube timecodes</h3>
           <div style="display: flex; flex-direction: column; gap: 10px;">
@@ -1436,7 +1478,7 @@
         </div>
       {/if}
 
-      {#if !currentUser && showSessionLogin}
+      {#if !currentUser && showSessionLogin && !overlay}
         <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
         <div class="modal-backdrop" on:click={() => (showSessionLogin = false)}>
           <div class="modal-card" on:click|stopPropagation role="dialog" aria-modal="true" tabindex="-1">
@@ -1453,7 +1495,7 @@
         </div>
       {/if}
 
-      {#if viewerCanInteract}
+      {#if viewerCanInteract && !overlay}
         <div class="q-form">
           <form on:submit={submitQuestion}>
             <textarea
@@ -1481,6 +1523,7 @@
       {/if}
 
       <!-- Toolbar -->
+      {#if !overlay}
       <div class="toolbar section-gap">
         <div class="tab-bar">
           <button
@@ -1557,6 +1600,7 @@
         </button>
 
       </div>
+      {/if}
 
       <!-- Question list -->
       {#if loadedSessionSort === 'downvoted' && sessionData}
@@ -1587,7 +1631,8 @@
 
         {#each visibleQuestions as item}
           <article class="q-card" class:answering={item.is_answering === 1} class:answered={item.is_answered === 1} class:rejected={item.is_rejected === 1} class:new-highlight={item.id === newQuestionId}>
-            <div class="q-vote-col">
+            <div class="q-vote-col" style={overlay ? 'justify-content: center;' : ''}>
+              {#if !overlay}
               <button
                 type="button"
                 class="q-vote-btn"
@@ -1596,9 +1641,11 @@
                 disabled={!viewerCanInteract || voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1 || item.is_rejected === 1 || item.is_deleted === 1}
                 title="Upvote"
               >&#9650;</button>
+              {/if}
 
               <span class="q-score">{item.score}</span>
 
+              {#if !overlay}
               <button
                 type="button"
                 class="q-vote-btn"
@@ -1607,6 +1654,7 @@
                 disabled={!viewerCanInteract || voteBusy.has(item.id) || item.is_answered === 1 || item.is_answering === 1 || item.is_rejected === 1 || item.is_deleted === 1}
                 title="Downvote"
               >&#9660;</button>
+              {/if}
             </div>
 
             <div class="q-body-col">
@@ -1637,7 +1685,7 @@
                 {/if}
               </div>
 
-              {#if admin}
+              {#if admin && !overlay}
                 <div class="q-actions" style="display: flex; align-items: center; gap: 6px;">
                   {#if item.is_deleted === 1}
                     <button
@@ -1709,11 +1757,18 @@
           </article>
         {/each}
       </div>
+
+      {#if overlay && overlayQrSvg}
+        <div class="overlay-qr">
+          {@html overlayQrSvg}
+          <p class="overlay-qr-label">Ask a question</p>
+        </div>
+      {/if}
     </div>
   {/if}
 </div>
 
-<Notifications history={notifHistory} toasts={activeToasts} />
+{#if !overlay}<Notifications history={notifHistory} toasts={activeToasts} />{/if}
 
 <style>
   .modal-backdrop {
@@ -1785,5 +1840,36 @@
     stroke-dasharray: 28.27;
     transform: scale(-1, 1) rotate(-90deg);
     transform-origin: 6px 6px;
+  }
+
+  .overlay-qr {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 10px 10px 6px;
+    box-shadow: var(--shadow-md);
+    z-index: 10;
+  }
+
+  .overlay-qr :global(svg) {
+    width: 130px;
+    height: 130px;
+    display: block;
+  }
+
+  .overlay-qr-label {
+    margin: 6px 0 0;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--ink-secondary);
+    text-align: center;
   }
 </style>

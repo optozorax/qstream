@@ -43,6 +43,74 @@ struct AppState {
     sse_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
 }
 
+const SESSION_MAX_AGE_SECS: i64 = 48 * 60 * 60;
+
+fn active_session_condition_sql(alias: &str) -> String {
+    format!("{alias}.is_active = 1 AND {alias}.created_at > unixepoch() - {SESSION_MAX_AGE_SECS}")
+}
+
+fn effective_session_is_active_sql(alias: &str) -> String {
+    format!(
+        "CASE WHEN {} THEN 1 ELSE 0 END",
+        active_session_condition_sql(alias)
+    )
+}
+
+fn effective_session_stopped_at_sql(alias: &str) -> String {
+    format!(
+        "CASE WHEN {alias}.is_active = 1 AND {alias}.created_at <= unixepoch() - {SESSION_MAX_AGE_SECS} \
+         THEN COALESCE({alias}.stopped_at, {alias}.created_at + {SESSION_MAX_AGE_SECS}) \
+         ELSE {alias}.stopped_at END"
+    )
+}
+
+fn effective_session_donations_enabled_sql(alias: &str) -> String {
+    format!(
+        "CASE WHEN {} THEN {alias}.donations_enabled ELSE 0 END",
+        active_session_condition_sql(alias)
+    )
+}
+
+fn effective_session_donations_enabled_at_sql(alias: &str) -> String {
+    format!(
+        "CASE WHEN {} THEN {alias}.donations_enabled_at ELSE NULL END",
+        active_session_condition_sql(alias)
+    )
+}
+
+fn effective_session_donations_min_external_id_sql(alias: &str) -> String {
+    format!(
+        "CASE WHEN {} THEN {alias}.donations_min_external_id ELSE NULL END",
+        active_session_condition_sql(alias)
+    )
+}
+
+fn stream_session_select_sql(alias: &str) -> String {
+    format!(
+        r#"
+            {alias}.id,
+            {alias}.owner_user_id,
+            {alias}.public_code,
+            {alias}.created_at,
+            {is_active} AS is_active,
+            {alias}.name,
+            {alias}.description,
+            {alias}.stream_link,
+            {stopped_at} AS stopped_at,
+            {alias}.downvote_threshold,
+            {donations_enabled} AS donations_enabled,
+            {donations_enabled_at} AS donations_enabled_at,
+            {donations_min_external_id} AS donations_min_external_id
+        "#,
+        alias = alias,
+        is_active = effective_session_is_active_sql(alias),
+        stopped_at = effective_session_stopped_at_sql(alias),
+        donations_enabled = effective_session_donations_enabled_sql(alias),
+        donations_enabled_at = effective_session_donations_enabled_at_sql(alias),
+        donations_min_external_id = effective_session_donations_min_external_id_sql(alias),
+    )
+}
+
 #[derive(Clone, Default)]
 struct SessionEventBus {
     channels: Arc<RwLock<HashMap<i64, broadcast::Sender<SessionEvent>>>>,
@@ -697,6 +765,15 @@ async fn main() -> anyhow::Result<()> {
         sse_connections: Arc::new(Mutex::new(HashMap::new())),
     };
 
+    expire_stale_sessions_once(&state).await?;
+
+    {
+        let state_for_expiry = state.clone();
+        tokio::spawn(async move {
+            expire_stale_sessions_loop(state_for_expiry).await;
+        });
+    }
+
     {
         let state_for_sync = state.clone();
         tokio::spawn(async move {
@@ -1199,25 +1276,27 @@ async fn da_oauth_callback(
     .map_err(|err| AppError::internal(format!("failed to upsert da integration: {err}")))?;
 
     let target_session_id = if let Some(session_code) = session_code_from_return_to(&return_to) {
-        sqlx::query_scalar::<_, i64>(
+        let query = format!(
             r#"
             SELECT id
-            FROM stream_sessions
-            WHERE owner_user_id = ?1
-              AND public_code = ?2
-              AND is_active = 1
+            FROM stream_sessions s
+            WHERE s.owner_user_id = ?1
+              AND s.public_code = ?2
+              AND {}
             LIMIT 1;
             "#,
-        )
-        .bind(owner_user_id)
-        .bind(session_code)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|err| {
-            AppError::internal(format!(
-                "failed to resolve target session for da oauth: {err}"
-            ))
-        })?
+            active_session_condition_sql("s")
+        );
+        sqlx::query_scalar::<_, i64>(&query)
+            .bind(owner_user_id)
+            .bind(session_code)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|err| {
+                AppError::internal(format!(
+                    "failed to resolve target session for da oauth: {err}"
+                ))
+            })?
     } else {
         None
     };
@@ -1250,7 +1329,7 @@ async fn da_oauth_callback(
         };
 
     if let Some(session_id) = target_session_id {
-        sqlx::query(
+        let query = format!(
             r#"
             UPDATE stream_sessions
             SET donations_enabled = CASE WHEN id = ?3 THEN 1 ELSE 0 END,
@@ -1267,21 +1346,23 @@ async fn da_oauth_callback(
                     ELSE NULL
                 END
             WHERE owner_user_id = ?1
-              AND is_active = 1;
+              AND {};
             "#,
-        )
-        .bind(owner_user_id)
-        .bind(baseline_external_id)
-        .bind(session_id)
-        .execute(&state.db)
-        .await
-        .map_err(|err| {
-            AppError::internal(format!(
-                "failed to bind da integration to target session: {err}"
-            ))
-        })?;
+            active_session_condition_sql("stream_sessions")
+        );
+        sqlx::query(&query)
+            .bind(owner_user_id)
+            .bind(baseline_external_id)
+            .bind(session_id)
+            .execute(&state.db)
+            .await
+            .map_err(|err| {
+                AppError::internal(format!(
+                    "failed to bind da integration to target session: {err}"
+                ))
+            })?;
     } else {
-        sqlx::query(
+        let query = format!(
             r#"
             UPDATE stream_sessions
             SET donations_enabled_at = COALESCE(donations_enabled_at, unixepoch()),
@@ -1291,29 +1372,35 @@ async fn da_oauth_callback(
                     ELSE donations_min_external_id
                 END
             WHERE owner_user_id = ?1
-              AND is_active = 1
+              AND {}
               AND donations_enabled = 1;
             "#,
-        )
-        .bind(owner_user_id)
-        .bind(baseline_external_id)
-        .execute(&state.db)
-        .await
-        .map_err(|err| AppError::internal(format!("failed to align donation baseline: {err}")))?;
+            active_session_condition_sql("stream_sessions")
+        );
+        sqlx::query(&query)
+            .bind(owner_user_id)
+            .bind(baseline_external_id)
+            .execute(&state.db)
+            .await
+            .map_err(|err| {
+                AppError::internal(format!("failed to align donation baseline: {err}"))
+            })?;
     }
 
-    let active_session_ids = sqlx::query_scalar::<_, i64>(
+    let active_sessions_query = format!(
         r#"
         SELECT id
-        FROM stream_sessions
-        WHERE owner_user_id = ?1
-          AND is_active = 1;
+        FROM stream_sessions s
+        WHERE s.owner_user_id = ?1
+          AND {};
         "#,
-    )
-    .bind(owner_user_id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|err| AppError::internal(format!("failed to list active sessions: {err}")))?;
+        active_session_condition_sql("s")
+    );
+    let active_session_ids = sqlx::query_scalar::<_, i64>(&active_sessions_query)
+        .bind(owner_user_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to list active sessions: {err}")))?;
     for session_id in active_session_ids {
         state
             .session_events
@@ -1432,31 +1519,21 @@ async fn list_user_sessions(
 ) -> Result<Json<ListUserSessionsResponse>, AppError> {
     let auth = require_auth_user(&state, &headers).await?;
 
-    let sessions = sqlx::query_as::<_, StreamSession>(
+    let query = format!(
         r#"
         SELECT
-            id,
-            owner_user_id,
-            public_code,
-            created_at,
-            is_active,
-            name,
-            description,
-            stream_link,
-            stopped_at,
-            downvote_threshold,
-            donations_enabled,
-            donations_enabled_at,
-            donations_min_external_id
-        FROM stream_sessions
-        WHERE owner_user_id = ?1
-        ORDER BY created_at DESC;
+            {}
+        FROM stream_sessions s
+        WHERE s.owner_user_id = ?1
+        ORDER BY s.created_at DESC;
         "#,
-    )
-    .bind(auth.user_id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|err| AppError::internal(format!("failed to list sessions: {err}")))?;
+        stream_session_select_sql("s")
+    );
+    let sessions = sqlx::query_as::<_, StreamSession>(&query)
+        .bind(auth.user_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to list sessions: {err}")))?;
 
     Ok(Json(ListUserSessionsResponse { sessions }))
 }
@@ -1518,22 +1595,25 @@ async fn create_session(
         .map(|t| t.clamp(1, 1000))
         .unwrap_or(5);
 
-    let has_active_donation_session: Option<i64> = sqlx::query_scalar(
+    let has_active_donation_session_query = format!(
         r#"
         SELECT id
-        FROM stream_sessions
-        WHERE owner_user_id = ?1
-          AND is_active = 1
-          AND donations_enabled = 1
+        FROM stream_sessions s
+        WHERE s.owner_user_id = ?1
+          AND {}
+          AND s.donations_enabled = 1
         LIMIT 1;
         "#,
-    )
-    .bind(auth.user_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|err| {
-        AppError::internal(format!("failed to check donation-enabled sessions: {err}"))
-    })?;
+        active_session_condition_sql("s")
+    );
+    let has_active_donation_session: Option<i64> =
+        sqlx::query_scalar(&has_active_donation_session_query)
+            .bind(auth.user_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|err| {
+                AppError::internal(format!("failed to check donation-enabled sessions: {err}"))
+            })?;
 
     let donations_enabled_default = if has_active_donation_session.is_some() {
         0
@@ -1608,30 +1688,20 @@ async fn create_session(
     let row_id =
         inserted_id.ok_or_else(|| AppError::internal("failed to generate unique session code"))?;
 
-    let session = sqlx::query_as::<_, StreamSession>(
+    let query = format!(
         r#"
         SELECT
-            id,
-            owner_user_id,
-            public_code,
-            created_at,
-            is_active,
-            name,
-            description,
-            stream_link,
-            stopped_at,
-            downvote_threshold,
-            donations_enabled,
-            donations_enabled_at,
-            donations_min_external_id
-        FROM stream_sessions
-        WHERE id = ?1;
+            {}
+        FROM stream_sessions s
+        WHERE s.id = ?1;
         "#,
-    )
-    .bind(row_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|err| AppError::internal(format!("failed to fetch new session: {err}")))?;
+        stream_session_select_sql("s")
+    );
+    let session = sqlx::query_as::<_, StreamSession>(&query)
+        .bind(row_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to fetch new session: {err}")))?;
 
     tracing::info!(user_id = auth.user_id, code = %session.public_code, %name, "session created");
     Ok(Json(CreateSessionResponse {
@@ -1918,20 +1988,22 @@ async fn vote_question(
         return Err(AppError::bad_request("vote value must be -1, 0, or 1"));
     }
 
-    let question_meta_row = sqlx::query_as::<_, QuestionVoteMetaRow>(
+    let question_meta_sql = format!(
         r#"
-        SELECT q.session_id, s.owner_user_id, s.is_active AS session_is_active,
+        SELECT q.session_id, s.owner_user_id, {} AS session_is_active,
                q.status
         FROM questions q
         JOIN stream_sessions s ON s.id = q.session_id
         WHERE q.id = ?1;
         "#,
-    )
-    .bind(question_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|err| AppError::internal(format!("failed to find question: {err}")))?
-    .ok_or_else(|| AppError::not_found("question not found"))?;
+        effective_session_is_active_sql("s")
+    );
+    let question_meta_row = sqlx::query_as::<_, QuestionVoteMetaRow>(&question_meta_sql)
+        .bind(question_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to find question: {err}")))?
+        .ok_or_else(|| AppError::not_found("question not found"))?;
 
     let question_meta = QuestionVoteMeta {
         session_id: question_meta_row.session_id,
@@ -2135,12 +2207,12 @@ async fn moderate_question(
 ) -> Result<Json<ModerateQuestionResponse>, AppError> {
     let auth = require_auth_user(&state, &headers).await?;
 
-    let meta = sqlx::query_as::<_, QuestionAdminMeta>(
+    let question_admin_meta_sql = format!(
         r#"
         SELECT s.id AS session_id,
                s.owner_user_id,
                q.author_user_id,
-               s.is_active AS session_is_active,
+               {} AS session_is_active,
                s.name AS session_name,
                q.body AS question_body
         FROM questions q
@@ -2148,12 +2220,16 @@ async fn moderate_question(
         WHERE q.id = ?1
         LIMIT 1;
         "#,
-    )
-    .bind(question_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|err| AppError::internal(format!("failed to load question admin metadata: {err}")))?
-    .ok_or_else(|| AppError::not_found("question not found"))?;
+        effective_session_is_active_sql("s")
+    );
+    let meta = sqlx::query_as::<_, QuestionAdminMeta>(&question_admin_meta_sql)
+        .bind(question_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|err| {
+            AppError::internal(format!("failed to load question admin metadata: {err}"))
+        })?
+        .ok_or_else(|| AppError::not_found("question not found"))?;
 
     if meta.owner_user_id != auth.user_id {
         return Err(AppError::forbidden(
@@ -2494,23 +2570,25 @@ async fn moderate_donation(
 ) -> Result<Json<ModerateDonationResponse>, AppError> {
     let auth = require_auth_user(&state, &headers).await?;
 
-    let meta = sqlx::query_as::<_, DonationAdminMeta>(
+    let donation_admin_meta_sql = format!(
         r#"
         SELECT
             s.id AS session_id,
             s.owner_user_id,
-            s.is_active AS session_is_active
+            {} AS session_is_active
         FROM donations d
         JOIN stream_sessions s ON s.id = d.session_id
         WHERE d.id = ?1
         LIMIT 1;
         "#,
-    )
-    .bind(donation_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|err| AppError::internal(format!("failed to load donation metadata: {err}")))?
-    .ok_or_else(|| AppError::not_found("donation not found"))?;
+        effective_session_is_active_sql("s")
+    );
+    let meta = sqlx::query_as::<_, DonationAdminMeta>(&donation_admin_meta_sql)
+        .bind(donation_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to load donation metadata: {err}")))?
+        .ok_or_else(|| AppError::not_found("donation not found"))?;
 
     if meta.owner_user_id != auth.user_id {
         return Err(AppError::forbidden(
@@ -2803,6 +2881,63 @@ async fn stop_session(
 
     let updated = find_session_by_code(&state.db, &code).await?;
     Ok(Json(updated))
+}
+
+async fn expire_stale_sessions_once(state: &AppState) -> anyhow::Result<()> {
+    let expired_session_ids = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT id
+        FROM stream_sessions
+        WHERE is_active = 1
+          AND created_at <= unixepoch() - ?1;
+        "#,
+    )
+    .bind(SESSION_MAX_AGE_SECS)
+    .fetch_all(&state.db)
+    .await?;
+
+    if expired_session_ids.is_empty() {
+        return Ok(());
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE stream_sessions
+        SET is_active = 0,
+            stopped_at = COALESCE(stopped_at, created_at + ?1),
+            donations_enabled = 0,
+            donations_enabled_at = NULL,
+            donations_min_external_id = NULL
+        WHERE is_active = 1
+          AND created_at <= unixepoch() - ?1;
+        "#,
+    )
+    .bind(SESSION_MAX_AGE_SECS)
+    .execute(&state.db)
+    .await?;
+
+    for session_id in &expired_session_ids {
+        state
+            .session_events
+            .publish(*session_id, SessionEvent::resync())
+            .await;
+    }
+
+    tracing::info!(
+        count = expired_session_ids.len(),
+        "auto-closed stream sessions older than 48 hours"
+    );
+
+    Ok(())
+}
+
+async fn expire_stale_sessions_loop(state: AppState) {
+    loop {
+        if let Err(err) = expire_stale_sessions_once(&state).await {
+            tracing::warn!("failed to auto-close stale sessions: {err}");
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
 }
 
 async fn delete_session(
@@ -3128,32 +3263,22 @@ async fn require_auth_user_by_token(state: &AppState, token: &str) -> Result<Aut
 }
 
 async fn find_session_by_code(db: &SqlitePool, code: &str) -> Result<StreamSession, AppError> {
-    sqlx::query_as::<_, StreamSession>(
+    let query = format!(
         r#"
         SELECT
-            id,
-            owner_user_id,
-            public_code,
-            created_at,
-            is_active,
-            name,
-            description,
-            stream_link,
-            stopped_at,
-            downvote_threshold,
-            donations_enabled,
-            donations_enabled_at,
-            donations_min_external_id
-        FROM stream_sessions
-        WHERE public_code = ?1
+            {}
+        FROM stream_sessions s
+        WHERE s.public_code = ?1
         LIMIT 1;
         "#,
-    )
-    .bind(code)
-    .fetch_optional(db)
-    .await
-    .map_err(|err| AppError::internal(format!("failed to find session: {err}")))?
-    .ok_or_else(|| AppError::not_found("session not found"))
+        stream_session_select_sql("s")
+    );
+    sqlx::query_as::<_, StreamSession>(&query)
+        .bind(code)
+        .fetch_optional(db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to find session: {err}")))?
+        .ok_or_else(|| AppError::not_found("session not found"))
 }
 
 async fn list_feed_items_for_session(
@@ -3718,18 +3843,20 @@ async fn donation_sync_loop(state: AppState) {
 }
 
 async fn sync_donations_once(state: &AppState) -> anyhow::Result<()> {
-    let owners = sqlx::query_scalar::<_, i64>(
+    let owners_query = format!(
         r#"
         SELECT DISTINCT di.owner_user_id
         FROM da_integrations di
         JOIN stream_sessions s
           ON s.owner_user_id = di.owner_user_id
-         AND s.is_active = 1
+         AND {}
          AND s.donations_enabled = 1;
         "#,
-    )
-    .fetch_all(&state.db)
-    .await?;
+        active_session_condition_sql("s")
+    );
+    let owners = sqlx::query_scalar::<_, i64>(&owners_query)
+        .fetch_all(&state.db)
+        .await?;
 
     for owner_user_id in owners {
         if let Err(err) = sync_owner_donations(state, owner_user_id).await {
@@ -3752,23 +3879,25 @@ async fn sync_donations_once(state: &AppState) -> anyhow::Result<()> {
 }
 
 async fn sync_owner_donations(state: &AppState, owner_user_id: i64) -> anyhow::Result<()> {
-    let session = sqlx::query_as::<_, DonationSyncSessionRow>(
+    let session_query = format!(
         r#"
         SELECT
             id AS session_id,
             donations_min_external_id AS min_external_id
         FROM stream_sessions
         WHERE owner_user_id = ?1
-          AND is_active = 1
+          AND {}
           AND donations_enabled = 1
         ORDER BY COALESCE(donations_enabled_at, created_at) DESC
         LIMIT 1;
         "#,
-    )
-    .bind(owner_user_id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| anyhow::anyhow!("no active donation-enabled session"))?;
+        active_session_condition_sql("stream_sessions")
+    );
+    let session = sqlx::query_as::<_, DonationSyncSessionRow>(&session_query)
+        .bind(owner_user_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no active donation-enabled session"))?;
 
     let integration = sqlx::query_as::<_, DaIntegrationAuthRow>(
         r#"

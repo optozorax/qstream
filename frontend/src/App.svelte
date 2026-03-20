@@ -1363,6 +1363,9 @@
                 bind:description={createDescription}
                 bind:streamLink={createStreamLink}
               />
+              <p class="text-sm text-secondary" style="margin: 0;">
+                Stream sessions auto-close after 48 hours from creation.
+              </p>
               <div class="form-actions form-actions-wrap">
                 <button type="submit" class="btn btn-primary" disabled={createBusy}>
                   {createBusy ? 'Creating...' : 'Create'}
@@ -1544,6 +1547,9 @@
       {#if admin && showSessionSettings && !overlay}
         <div class="card section-gap" style="margin-bottom: 16px;">
           <h3 style="margin: 0 0 12px;">Session settings</h3>
+          <p class="text-sm text-secondary" style="margin: 0 0 12px;">
+            Stream sessions auto-close after 48 hours from creation.
+          </p>
           <form on:submit={updateSessionSettings}>
             <div class="settings-form-body">
               <SessionDetailsFields

@@ -17,6 +17,7 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     env,
+    future::Future,
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -44,6 +45,10 @@ struct AppState {
 }
 
 const SESSION_MAX_AGE_SECS: i64 = 48 * 60 * 60;
+const AUTH_SESSION_TOUCH_INTERVAL_SECS: i64 = 10 * 60;
+const DA_SYNC_STATE_TOUCH_INTERVAL_SECS: i64 = 15 * 60;
+const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 3;
+const SQLITE_BUSY_RETRY_DELAY_MS: u64 = 250;
 
 fn active_session_condition_sql(alias: &str) -> String {
     format!("{alias}.is_active = 1 AND {alias}.created_at > unixepoch() - {SESSION_MAX_AGE_SECS}")
@@ -442,6 +447,7 @@ struct DonationView {
 #[derive(FromRow)]
 struct AuthUser {
     user_id: i64,
+    last_seen_at: i64,
 }
 
 #[derive(FromRow)]
@@ -608,6 +614,8 @@ struct DaIntegrationAuthRow {
     token_expires_at: i64,
     scope: String,
     last_seen_external_id: Option<i64>,
+    last_sync_at: Option<i64>,
+    last_error: Option<String>,
 }
 
 #[derive(FromRow)]
@@ -3233,7 +3241,7 @@ async fn require_auth_user_by_token(state: &AppState, token: &str) -> Result<Aut
 
     let auth_user = sqlx::query_as::<_, AuthUser>(
         r#"
-        SELECT s.user_id
+        SELECT s.user_id, s.last_seen_at
         FROM auth_sessions s
         WHERE s.token_hash = ?1
           AND (s.expires_at IS NULL OR s.expires_at > unixepoch())
@@ -3247,17 +3255,31 @@ async fn require_auth_user_by_token(state: &AppState, token: &str) -> Result<Aut
     .map_err(|err| AppError::internal(format!("failed to validate token: {err}")))?
     .ok_or_else(|| AppError::unauthorized("invalid or expired token"))?;
 
-    sqlx::query(
-        r#"
-        UPDATE auth_sessions
-        SET last_seen_at = unixepoch()
-        WHERE token_hash = ?1;
-        "#,
-    )
-    .bind(token_hash)
-    .execute(&state.db)
-    .await
-    .map_err(|err| AppError::internal(format!("failed to refresh auth session: {err}")))?;
+    if auth_user.last_seen_at <= now_unix() - AUTH_SESSION_TOUCH_INTERVAL_SECS {
+        let db = state.db.clone();
+        let token_hash_for_update = token_hash.clone();
+        retry_sqlite_busy("touch auth session", move || {
+            let db = db.clone();
+            let token_hash = token_hash_for_update.clone();
+            async move {
+                sqlx::query(
+                    r#"
+                    UPDATE auth_sessions
+                    SET last_seen_at = unixepoch()
+                    WHERE token_hash = ?1
+                      AND last_seen_at <= unixepoch() - ?2;
+                    "#,
+                )
+                .bind(token_hash)
+                .bind(AUTH_SESSION_TOUCH_INTERVAL_SECS)
+                .execute(&db)
+                .await
+                .map(|_| ())
+            }
+        })
+        .await
+        .map_err(|err| AppError::internal(format!("failed to refresh auth session: {err}")))?;
+    }
 
     Ok(auth_user)
 }
@@ -3861,16 +3883,26 @@ async fn sync_donations_once(state: &AppState) -> anyhow::Result<()> {
     for owner_user_id in owners {
         if let Err(err) = sync_owner_donations(state, owner_user_id).await {
             tracing::warn!(owner_user_id, "failed to sync donations: {err}");
-            let _ = sqlx::query(
-                r#"
-                UPDATE da_integrations
-                SET last_error = ?2, updated_at = unixepoch()
-                WHERE owner_user_id = ?1;
-                "#,
-            )
-            .bind(owner_user_id)
-            .bind(err.to_string())
-            .execute(&state.db)
+            let db = state.db.clone();
+            let error_text = err.to_string();
+            let _ = retry_sqlite_busy("store donation sync error", move || {
+                let db = db.clone();
+                let error_text = error_text.clone();
+                async move {
+                    sqlx::query(
+                        r#"
+                        UPDATE da_integrations
+                        SET last_error = ?2, updated_at = unixepoch()
+                        WHERE owner_user_id = ?1;
+                        "#,
+                    )
+                    .bind(owner_user_id)
+                    .bind(error_text)
+                    .execute(&db)
+                    .await
+                    .map(|_| ())
+                }
+            })
             .await;
         }
     }
@@ -3908,7 +3940,9 @@ async fn sync_owner_donations(state: &AppState, owner_user_id: i64) -> anyhow::R
             refresh_token,
             token_expires_at,
             scope,
-            last_seen_external_id
+            last_seen_external_id,
+            last_sync_at,
+            last_error
         FROM da_integrations
         WHERE owner_user_id = ?1
         LIMIT 1;
@@ -3935,38 +3969,52 @@ async fn sync_owner_donations(state: &AppState, owner_user_id: i64) -> anyhow::R
         let amount_minor = amount_to_minor(donation.amount);
         let usd_cents = convert_amount_minor_to_usd_cents(amount_minor, &donation.currency);
         let created_at = now_unix();
-
-        let insert = sqlx::query(
-            r#"
-            INSERT INTO donations (
-                session_id,
-                owner_user_id,
-                external_donation_id,
-                donor_name,
-                body,
-                amount_minor,
-                currency,
-                usd_cents,
-                provider_created_at,
-                status,
-                created_at
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-            ON CONFLICT(owner_user_id, external_donation_id) DO NOTHING;
-            "#,
-        )
-        .bind(session.session_id)
-        .bind(owner_user_id)
-        .bind(donation.id)
-        .bind(&donor_name)
-        .bind(&body)
-        .bind(amount_minor)
-        .bind(donation.currency.to_ascii_uppercase())
-        .bind(usd_cents)
-        .bind(donation.created_at.as_deref())
-        .bind(QuestionStatus::New.as_str())
-        .bind(created_at)
-        .execute(&state.db)
+        let db = state.db.clone();
+        let session_id = session.session_id;
+        let donation_id = donation.id;
+        let currency = donation.currency.to_ascii_uppercase();
+        let provider_created_at = donation.created_at.clone();
+        let insert = retry_sqlite_busy("insert donation", move || {
+            let db = db.clone();
+            let donor_name = donor_name.clone();
+            let body = body.clone();
+            let currency = currency.clone();
+            let provider_created_at = provider_created_at.clone();
+            async move {
+                sqlx::query(
+                    r#"
+                    INSERT INTO donations (
+                        session_id,
+                        owner_user_id,
+                        external_donation_id,
+                        donor_name,
+                        body,
+                        amount_minor,
+                        currency,
+                        usd_cents,
+                        provider_created_at,
+                        status,
+                        created_at
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    ON CONFLICT(owner_user_id, external_donation_id) DO NOTHING;
+                    "#,
+                )
+                .bind(session_id)
+                .bind(owner_user_id)
+                .bind(donation_id)
+                .bind(donor_name)
+                .bind(body)
+                .bind(amount_minor)
+                .bind(currency)
+                .bind(usd_cents)
+                .bind(provider_created_at.as_deref())
+                .bind(QuestionStatus::New.as_str())
+                .bind(created_at)
+                .execute(&db)
+                .await
+            }
+        })
         .await?;
 
         if insert.rows_affected() > 0 {
@@ -3980,20 +4028,34 @@ async fn sync_owner_donations(state: &AppState, owner_user_id: i64) -> anyhow::R
         }
     }
 
-    sqlx::query(
-        r#"
-        UPDATE da_integrations
-        SET last_seen_external_id = ?2,
-            last_sync_at = unixepoch(),
-            last_error = NULL,
-            updated_at = unixepoch()
-        WHERE owner_user_id = ?1;
-        "#,
-    )
-    .bind(owner_user_id)
-    .bind(max_seen)
-    .execute(&state.db)
-    .await?;
+    let should_update_sync_state = max_seen != integration.last_seen_external_id.unwrap_or(0)
+        || integration.last_error.is_some()
+        || integration.last_sync_at.unwrap_or(0) <= now_unix() - DA_SYNC_STATE_TOUCH_INTERVAL_SECS;
+
+    if should_update_sync_state {
+        let db = state.db.clone();
+        retry_sqlite_busy("update donation sync state", move || {
+            let db = db.clone();
+            async move {
+                sqlx::query(
+                    r#"
+                    UPDATE da_integrations
+                    SET last_seen_external_id = ?2,
+                        last_sync_at = unixepoch(),
+                        last_error = NULL,
+                        updated_at = unixepoch()
+                    WHERE owner_user_id = ?1;
+                    "#,
+                )
+                .bind(owner_user_id)
+                .bind(max_seen)
+                .execute(&db)
+                .await
+                .map(|_| ())
+            }
+        })
+        .await?;
+    }
 
     Ok(())
 }
@@ -4047,23 +4109,37 @@ async fn ensure_da_access_token(
         .unwrap_or(&integration.scope)
         .to_string();
 
-    sqlx::query(
-        r#"
-        UPDATE da_integrations
-        SET access_token = ?2,
-            refresh_token = ?3,
-            token_expires_at = ?4,
-            scope = ?5,
-            updated_at = unixepoch()
-        WHERE owner_user_id = ?1;
-        "#,
-    )
-    .bind(integration.owner_user_id)
-    .bind(&refreshed.access_token)
-    .bind(new_refresh)
-    .bind(new_expires_at)
-    .bind(&new_scope)
-    .execute(&state.db)
+    let db = state.db.clone();
+    let access_token = refreshed.access_token.clone();
+    let new_refresh_owned = new_refresh.to_string();
+    let new_scope_owned = new_scope.clone();
+    retry_sqlite_busy("refresh da access token", move || {
+        let db = db.clone();
+        let access_token = access_token.clone();
+        let new_refresh = new_refresh_owned.clone();
+        let new_scope = new_scope_owned.clone();
+        async move {
+            sqlx::query(
+                r#"
+                UPDATE da_integrations
+                SET access_token = ?2,
+                    refresh_token = ?3,
+                    token_expires_at = ?4,
+                    scope = ?5,
+                    updated_at = unixepoch()
+                WHERE owner_user_id = ?1;
+                "#,
+            )
+            .bind(integration.owner_user_id)
+            .bind(access_token)
+            .bind(new_refresh)
+            .bind(new_expires_at)
+            .bind(new_scope)
+            .execute(&db)
+            .await
+            .map(|_| ())
+        }
+    })
     .await?;
 
     Ok(DaIntegrationAuthRow {
@@ -4074,6 +4150,8 @@ async fn ensure_da_access_token(
         token_expires_at: new_expires_at,
         scope: new_scope,
         last_seen_external_id: integration.last_seen_external_id,
+        last_sync_at: integration.last_sync_at,
+        last_error: integration.last_error,
     })
 }
 
@@ -4090,7 +4168,9 @@ async fn resolve_donation_baseline_for_owner(
             refresh_token,
             token_expires_at,
             scope,
-            last_seen_external_id
+            last_seen_external_id,
+            last_sync_at,
+            last_error
         FROM da_integrations
         WHERE owner_user_id = ?1
         LIMIT 1;
@@ -4295,6 +4375,39 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn is_sqlite_busy_error(err: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(db_err) = err else {
+        return false;
+    };
+
+    db_err.code().as_deref() == Some("5")
+        || db_err.message().contains("database is locked")
+        || db_err.message().contains("database is busy")
+}
+
+async fn retry_sqlite_busy<T, F, Fut>(operation: &'static str, mut op: F) -> Result<T, sqlx::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, sqlx::Error>>,
+{
+    let mut attempt = 0usize;
+
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(err) if attempt < SQLITE_BUSY_RETRY_ATTEMPTS && is_sqlite_busy_error(&err) => {
+                attempt += 1;
+                tracing::warn!(operation, attempt, "sqlite busy; retrying write");
+                tokio::time::sleep(Duration::from_millis(
+                    SQLITE_BUSY_RETRY_DELAY_MS * attempt as u64,
+                ))
+                .await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 fn count_line_breaks(text: &str) -> usize {

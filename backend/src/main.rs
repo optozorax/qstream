@@ -1283,7 +1283,8 @@ async fn da_oauth_callback(
     .await
     .map_err(|err| AppError::internal(format!("failed to upsert da integration: {err}")))?;
 
-    let target_session_id = if let Some(session_code) = session_code_from_return_to(&return_to) {
+    let return_to_session_code = session_code_from_return_to(&return_to);
+    let target_session_id = if let Some(session_code) = return_to_session_code.as_deref() {
         let query = format!(
             r#"
             SELECT id
@@ -1308,6 +1309,15 @@ async fn da_oauth_callback(
     } else {
         None
     };
+
+    if return_to_session_code.is_some() && target_session_id.is_none() {
+        tracing::warn!(
+            owner_user_id,
+            da_user_id = da_user_payload.data.id,
+            return_to_session_code = ?return_to_session_code,
+            "da oauth callback referenced a session code, but no active target session was found"
+        );
+    }
 
     let fallback_external_id: i64 = sqlx::query_scalar(
         r#"
@@ -1409,6 +1419,7 @@ async fn da_oauth_callback(
         .fetch_all(&state.db)
         .await
         .map_err(|err| AppError::internal(format!("failed to list active sessions: {err}")))?;
+    let active_session_ids_for_log = active_session_ids.clone();
     for session_id in active_session_ids {
         state
             .session_events
@@ -1419,7 +1430,16 @@ async fn da_oauth_callback(
     tracing::info!(
         owner_user_id,
         da_user_id = da_user_payload.data.id,
-        "donationalerts oauth connected"
+        return_to_session_code = ?return_to_session_code,
+        target_session_id = ?target_session_id,
+        baseline_external_id,
+        active_session_ids = ?active_session_ids_for_log,
+        routing_mode = if target_session_id.is_some() {
+            "bind_target_session"
+        } else {
+            "align_existing_routing"
+        },
+        "donationalerts oauth connected and donation routing resolved"
     );
 
     Ok(redirect_with_fragment(&return_to, "da_oauth", Some("ok")))
@@ -1623,6 +1643,22 @@ async fn create_session(
                 AppError::internal(format!("failed to check donation-enabled sessions: {err}"))
             })?;
 
+    let active_session_ids_query = format!(
+        r#"
+        SELECT s.id
+        FROM stream_sessions s
+        WHERE s.owner_user_id = ?1
+          AND {}
+        ORDER BY s.created_at DESC;
+        "#,
+        active_session_condition_sql("s")
+    );
+    let active_session_ids = sqlx::query_scalar::<_, i64>(&active_session_ids_query)
+        .bind(auth.user_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|err| AppError::internal(format!("failed to list active sessions: {err}")))?;
+
     let donations_enabled_default = if has_active_donation_session.is_some() {
         0
     } else {
@@ -1711,7 +1747,17 @@ async fn create_session(
         .await
         .map_err(|err| AppError::internal(format!("failed to fetch new session: {err}")))?;
 
-    tracing::info!(user_id = auth.user_id, code = %session.public_code, %name, "session created");
+    tracing::info!(
+        owner_user_id = auth.user_id,
+        session_id = session.id,
+        code = %session.public_code,
+        %name,
+        active_session_ids = ?active_session_ids,
+        active_donation_session_id = ?has_active_donation_session,
+        donations_enabled_default,
+        donations_min_external_id_default = ?donations_min_external_id_default,
+        "session created"
+    );
     Ok(Json(CreateSessionResponse {
         public_url: build_public_session_url(&state.public_base_url, &session.public_code),
         session,
@@ -1796,7 +1842,13 @@ async fn session_events_handler(
             ));
         }
         *count += 1;
-        tracing::info!(ip = %ip, code = %code, connections = *count, "SSE client connected");
+        tracing::debug!(
+            ip = %ip,
+            session_id = session.id,
+            code = %code,
+            connections = *count,
+            "SSE client connected"
+        );
     }
 
     let receiver = state.session_events.subscribe(session.id).await;
@@ -1836,6 +1888,8 @@ async fn session_events_handler(
         inner: Box::pin(stream),
         sse_connections,
         ip,
+        session_id: session.id,
+        code: code.clone(),
         decremented: false,
     };
 
@@ -1871,6 +1925,8 @@ struct SseDropGuard<S> {
     inner: std::pin::Pin<Box<S>>,
     sse_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
     ip: IpAddr,
+    session_id: i64,
+    code: String,
     decremented: bool,
 }
 
@@ -1891,6 +1947,8 @@ impl<S> Drop for SseDropGuard<S> {
             self.decremented = true;
             let conns = self.sse_connections.clone();
             let ip = self.ip;
+            let session_id = self.session_id;
+            let code = self.code.clone();
             tokio::spawn(async move {
                 let mut conns = conns.lock().await;
                 if let Some(count) = conns.get_mut(&ip) {
@@ -1899,7 +1957,13 @@ impl<S> Drop for SseDropGuard<S> {
                     if remaining == 0 {
                         conns.remove(&ip);
                     }
-                    tracing::info!(ip = %ip, connections = remaining, "SSE client disconnected");
+                    tracing::debug!(
+                        ip = %ip,
+                        session_id,
+                        code = %code,
+                        connections = remaining,
+                        "SSE client disconnected"
+                    );
                 }
             });
         }
@@ -2881,7 +2945,14 @@ async fn stop_session(
     .await
     .map_err(|err| AppError::internal(format!("failed to stop session: {err}")))?;
 
-    tracing::info!(session_id = session.id, code = %code, "session stopped");
+    tracing::info!(
+        owner_user_id = auth.user_id,
+        session_id = session.id,
+        code = %code,
+        donations_enabled_before = session.donations_enabled,
+        stop_reason = "manual",
+        "session stopped"
+    );
     state
         .session_events
         .publish(session.id, SessionEvent::resync())
@@ -2892,9 +2963,9 @@ async fn stop_session(
 }
 
 async fn expire_stale_sessions_once(state: &AppState) -> anyhow::Result<()> {
-    let expired_session_ids = sqlx::query_scalar::<_, i64>(
+    let expired_sessions = sqlx::query_as::<_, (i64, i64, String)>(
         r#"
-        SELECT id
+        SELECT id, owner_user_id, public_code
         FROM stream_sessions
         WHERE is_active = 1
           AND created_at <= unixepoch() - ?1;
@@ -2904,9 +2975,11 @@ async fn expire_stale_sessions_once(state: &AppState) -> anyhow::Result<()> {
     .fetch_all(&state.db)
     .await?;
 
-    if expired_session_ids.is_empty() {
+    if expired_sessions.is_empty() {
         return Ok(());
     }
+
+    let expired_session_ids: Vec<i64> = expired_sessions.iter().map(|(id, _, _)| *id).collect();
 
     sqlx::query(
         r#"
@@ -2933,6 +3006,8 @@ async fn expire_stale_sessions_once(state: &AppState) -> anyhow::Result<()> {
 
     tracing::info!(
         count = expired_session_ids.len(),
+        expired_sessions = ?expired_sessions,
+        stop_reason = "max_duration_reached",
         "auto-closed stream sessions older than 48 hours"
     );
 
@@ -3045,6 +3120,28 @@ async fn update_session(
     let mut donations_enabled_at = session.donations_enabled_at;
     let mut donations_min_external_id = session.donations_min_external_id;
     let mut donations_routing_changed = false;
+    let previous_active_donation_session_ids = if payload.donations_enabled.is_some() {
+        let query = format!(
+            r#"
+            SELECT s.id
+            FROM stream_sessions s
+            WHERE s.owner_user_id = ?1
+              AND {}
+              AND s.donations_enabled = 1
+            ORDER BY COALESCE(s.donations_enabled_at, s.created_at) DESC;
+            "#,
+            active_session_condition_sql("s")
+        );
+        sqlx::query_scalar::<_, i64>(&query)
+            .bind(auth.user_id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|err| {
+                AppError::internal(format!("failed to list existing donation routing: {err}"))
+            })?
+    } else {
+        Vec::new()
+    };
 
     if let Some(enable_donations) = payload.donations_enabled {
         let next_value = if enable_donations { 1 } else { 0 };
@@ -3132,14 +3229,44 @@ async fn update_session(
     .await
     .map_err(|err| AppError::internal(format!("failed to update session: {err}")))?;
 
+    let updated = find_session_by_code(&state.db, &code).await?;
+    let current_active_donation_session_ids = if payload.donations_enabled.is_some() {
+        let query = format!(
+            r#"
+            SELECT s.id
+            FROM stream_sessions s
+            WHERE s.owner_user_id = ?1
+              AND {}
+              AND s.donations_enabled = 1
+            ORDER BY COALESCE(s.donations_enabled_at, s.created_at) DESC;
+            "#,
+            active_session_condition_sql("s")
+        );
+        sqlx::query_scalar::<_, i64>(&query)
+            .bind(auth.user_id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|err| {
+                AppError::internal(format!("failed to list updated donation routing: {err}"))
+            })?
+    } else {
+        Vec::new()
+    };
+
     tracing::info!(
+        owner_user_id = auth.user_id,
         session_id = session.id,
+        code = %code,
         %name,
         downvote_threshold,
+        session_active = session.is_active,
+        previous_donations_enabled = session.donations_enabled,
         donations_enabled,
+        donations_routing_changed,
+        previous_active_donation_session_ids = ?previous_active_donation_session_ids,
+        current_active_donation_session_ids = ?current_active_donation_session_ids,
         "session metadata updated"
     );
-    let updated = find_session_by_code(&state.db, &code).await?;
 
     if donations_routing_changed {
         let session_ids = sqlx::query_scalar::<_, i64>(
@@ -3960,6 +4087,9 @@ async fn sync_owner_donations(state: &AppState, owner_user_id: i64) -> anyhow::R
 
     let donations =
         fetch_donations_since(&state.http, &integration.access_token, baseline_id).await?;
+    let fetched_count = donations.len();
+    let mut inserted_count = 0usize;
+    let mut duplicate_count = 0usize;
     let mut max_seen = baseline_id;
 
     for donation in donations {
@@ -4018,6 +4148,7 @@ async fn sync_owner_donations(state: &AppState, owner_user_id: i64) -> anyhow::R
         .await?;
 
         if insert.rows_affected() > 0 {
+            inserted_count += 1;
             state
                 .session_events
                 .publish(
@@ -4025,6 +4156,8 @@ async fn sync_owner_donations(state: &AppState, owner_user_id: i64) -> anyhow::R
                     SessionEvent::donation_created(insert.last_insert_rowid()),
                 )
                 .await;
+        } else {
+            duplicate_count += 1;
         }
     }
 
@@ -4055,6 +4188,35 @@ async fn sync_owner_donations(state: &AppState, owner_user_id: i64) -> anyhow::R
             }
         })
         .await?;
+    }
+
+    let previous_last_seen = integration.last_seen_external_id.unwrap_or(0);
+    if fetched_count == 0 && !should_update_sync_state {
+        tracing::debug!(
+            owner_user_id,
+            session_id = session.session_id,
+            baseline_id,
+            fetched_count,
+            inserted_count,
+            duplicate_count,
+            previous_last_seen,
+            new_last_seen = max_seen,
+            state_write = should_update_sync_state,
+            "donation sync completed"
+        );
+    } else {
+        tracing::info!(
+            owner_user_id,
+            session_id = session.session_id,
+            baseline_id,
+            fetched_count,
+            inserted_count,
+            duplicate_count,
+            previous_last_seen,
+            new_last_seen = max_seen,
+            state_write = should_update_sync_state,
+            "donation sync completed"
+        );
     }
 
     Ok(())
@@ -4396,16 +4558,35 @@ where
 
     loop {
         match op().await {
-            Ok(value) => return Ok(value),
+            Ok(value) => {
+                if attempt > 0 {
+                    tracing::info!(
+                        operation,
+                        attempts = attempt + 1,
+                        "sqlite write succeeded after retries"
+                    );
+                }
+                return Ok(value);
+            }
             Err(err) if attempt < SQLITE_BUSY_RETRY_ATTEMPTS && is_sqlite_busy_error(&err) => {
                 attempt += 1;
-                tracing::warn!(operation, attempt, "sqlite busy; retrying write");
+                tracing::warn!(operation, attempt, error = %err, "sqlite busy; retrying write");
                 tokio::time::sleep(Duration::from_millis(
                     SQLITE_BUSY_RETRY_DELAY_MS * attempt as u64,
                 ))
                 .await;
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                if is_sqlite_busy_error(&err) {
+                    tracing::error!(
+                        operation,
+                        attempts = attempt + 1,
+                        error = %err,
+                        "sqlite busy write failed after retries"
+                    );
+                }
+                return Err(err);
+            }
         }
     }
 }

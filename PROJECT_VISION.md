@@ -104,7 +104,7 @@ During live streams, chat is noisy and fast. Good questions get lost quickly, an
 ### Post-Stream: YouTube Timecodes
 - After a session ends, the streamer sees a timecode panel.
 - Lists all answered questions as YouTube chapter lines: `M:SS Question text` (or `H:MM:SS` for sessions over an hour).
-- Sorted by answer time ascending (chronological chapter order).
+- Sorted by answer start time ascending so chapters point to where each answer begins.
 - Stream start time input in European format (`DD - MM - YYYY HH : MM : SS`), defaults to session creation time, adjustable with Reset button.
 - Timecodes recalculate instantly as start time changes.
 - Copy button for pasting into YouTube video description.

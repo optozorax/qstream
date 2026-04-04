@@ -298,7 +298,7 @@ Server layout, operations, and debugging checklist:
     - `Stop session` button with confirmation (ends session, no new questions accepted)
   - **YouTube timecodes panel** (owner only, shown after session ends):
     - displays all answered questions as YouTube chapter lines (`M:SS Question text` or `H:MM:SS Question text`)
-    - sorted by answer time ascending (chronological chapter order)
+    - sorted by answer start time ascending so chapters point to where each answer begins
     - stream start time input: `DD - MM - YYYY HH : MM : SS` (locale-independent European format)
     - defaults to session creation time; adjust to match actual stream start
     - timecodes update instantly as you change the start time

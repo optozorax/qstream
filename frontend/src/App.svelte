@@ -1122,6 +1122,10 @@
     return `${m}:${pad(s)}`
   }
 
+  function getTimecodeAnchorUnix(question) {
+    return question.answering_started_at ?? question.answered_at ?? null
+  }
+
   async function loadTimecodeQuestions() {
     timecodeLoading = true
     try {
@@ -1130,8 +1134,8 @@
         { auth: true }
       )
       timecodeQuestions = (payload.questions ?? [])
-        .filter((q) => q.is_answered === 1 && q.answered_at)
-        .sort((a, b) => a.answered_at - b.answered_at)
+        .filter((q) => q.is_answered === 1 && getTimecodeAnchorUnix(q) !== null)
+        .sort((a, b) => getTimecodeAnchorUnix(a) - getTimecodeAnchorUnix(b))
       timecodeQuestionsLoaded = true
     } catch {
       // silently ignore
@@ -1157,7 +1161,7 @@
   $: timecodeText = timecodeQuestions.length === 0
     ? ''
     : timecodeQuestions
-        .map((q) => `${formatTimecode(q.answered_at - timecodeStreamStartUnix)} ${q.body}`)
+        .map((q) => `${formatTimecode(getTimecodeAnchorUnix(q) - timecodeStreamStartUnix)} ${q.body}`)
         .join('\n')
 
   $: if (admin && sessionData?.is_active === 0 && !timecodeQuestionsLoaded) {

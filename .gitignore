@@ -13,3 +13,5 @@ frontend/.env
 .env.tunnel.local
 .env.install.local
 AGENTS.private.md
+target
+target-wsl

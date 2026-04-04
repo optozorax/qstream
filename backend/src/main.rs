@@ -3453,7 +3453,7 @@ async fn list_feed_items_for_session(
                     .then_with(|| b.created_at.cmp(&a.created_at))
             });
             donation_items.append(&mut question_items);
-            pin_answering_question_first(&mut donation_items);
+            pin_answering_item_first(&mut donation_items);
             donation_items
         }
         QuestionSort::New => {
@@ -3463,7 +3463,7 @@ async fn list_feed_items_for_session(
                     .cmp(&a.created_at)
                     .then_with(|| b.id.cmp(&a.id))
             });
-            pin_answering_question_first(&mut question_items);
+            pin_answering_item_first(&mut question_items);
             question_items
         }
         QuestionSort::Answered => {
@@ -3539,15 +3539,73 @@ async fn current_answering_conflict_message(
     )
 }
 
-fn pin_answering_question_first(items: &mut Vec<FeedItemView>) {
-    if let Some(index) = items
-        .iter()
-        .position(|item| item.kind == "question" && item.is_answering != 0)
-    {
+fn pin_answering_item_first(items: &mut Vec<FeedItemView>) {
+    if let Some(index) = items.iter().position(|item| item.is_answering != 0) {
         if index != 0 {
             let item = items.remove(index);
             items.insert(0, item);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed_item(id: i64, kind: &str, is_answering: i64, donation_usd_cents: Option<i64>) -> FeedItemView {
+        FeedItemView {
+            id,
+            kind: kind.to_string(),
+            question_id: (kind == "question").then_some(id),
+            donation_id: (kind == "donation").then_some(id.abs()),
+            session_id: 1,
+            author_user_id: Some(1),
+            author_nickname: "tester".to_string(),
+            author_is_banned: 0,
+            body: format!("{kind} {id}"),
+            is_answering,
+            is_answered: 0,
+            is_rejected: 0,
+            is_deleted: 0,
+            created_at: id,
+            score: 0,
+            votes_count: 0,
+            user_vote: 0,
+            answering_started_at: None,
+            answered_at: None,
+            donation_amount_minor: None,
+            donation_currency: None,
+            donation_usd_cents,
+            donation_external_id: None,
+        }
+    }
+
+    #[test]
+    fn pin_answering_item_first_moves_active_question_to_top() {
+        let mut items = vec![
+            feed_item(-10, "donation", 0, Some(1_000)),
+            feed_item(20, "question", 1, None),
+            feed_item(30, "question", 0, None),
+        ];
+
+        pin_answering_item_first(&mut items);
+
+        assert_eq!(items[0].kind, "question");
+        assert_eq!(items[0].id, 20);
+    }
+
+    #[test]
+    fn pin_answering_item_first_moves_active_donation_to_top() {
+        let mut items = vec![
+            feed_item(-10, "donation", 0, Some(5_000)),
+            feed_item(-20, "donation", 1, Some(100)),
+            feed_item(30, "question", 0, None),
+        ];
+
+        pin_answering_item_first(&mut items);
+
+        assert_eq!(items[0].kind, "donation");
+        assert_eq!(items[0].id, -20);
     }
 }
 

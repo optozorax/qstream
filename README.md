@@ -46,7 +46,7 @@ Use returned token in header (`auth_token` from URL fragment after OAuth callbac
   - public endpoint
   - returns ordered question list with score and vote count
   - `top/new` exclude answered questions and questions at or below the downvote threshold
-  - `answer in progress` questions are pinned to top in `top/new` regardless of score
+  - the single `answer in progress` item is pinned to top in `top/new` regardless of score
   - `answered` returns only answered questions, ordered by `answered_at DESC`
   - `downvoted` returns questions at or below the session's downvote threshold (excludes in-progress)
   - response includes `viewer_is_banned: bool` for the authenticated user
@@ -282,7 +282,7 @@ Server layout, operations, and debugging checklist:
   - public question list with real-time updates and sorting tabs (`Top` / `New` / `Answered` / `Downvoted`)
   - answered questions are removed from `Top`/`New` and shown only in `Answered`
   - questions at or below the session's downvote threshold move to `Downvoted` (everyone can still vote them back)
-  - `answer in progress` questions are pinned at the top in `Top`/`New` regardless of score
+  - the single `answer in progress` item is pinned at the top in `Top`/`New` regardless of score
   - update mode switch: `Manual` or `Auto`
   - in `Manual` mode, `Refresh` button shows a badge with pending new-question count from SSE notifications
   - logged-in non-owner viewers can toggle `Hide voted` to filter out questions they already voted on or asked

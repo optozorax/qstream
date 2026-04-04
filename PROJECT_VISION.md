@@ -65,7 +65,7 @@ During live streams, chat is noisy and fast. Good questions get lost quickly, an
 
 ### Question Statuses
 - **active**: default state, visible in Top and New tabs.
-- **answering**: currently being answered on stream; pinned to top of Top/New regardless of score.
+- **answering**: currently being answered on stream; pinned to top of Top/New regardless of score or donation amount.
 - **answered**: moved to Answered tab with timestamp.
 - **rejected**: explicitly declined; hidden from all tabs.
 - **deleted**: hard-deleted from DB.
